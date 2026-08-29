@@ -4,6 +4,8 @@ import random
 
 import chess
 
+import time
+
 PIECE_VALUE = {
     chess.PAWN: 100.0,
     chess.KNIGHT: 320.0,
@@ -16,6 +18,7 @@ MATE = 1e6
 
 MOBILITY_WEIGHT = 4.0
 MATE = 1e6
+MATE_SCORE = 100000
 
 PAWN_PST = [
      0,  0,  0,  0,  0,  0,  0,  0,
@@ -90,8 +93,9 @@ NOT_H_FILE = ~chess.BB_FILE_H & MASK_64
 
 PASSED_PAWN_BONUS = [0, 40, 50, 50, 75, 120, 200, 0]
 
-# Import time runs once per game, inside a 60 second budget, before your clock starts.
-# Load weights and build tables out here, not inside get_move.
+class SearchTimeout(Exception):
+    pass
+
 
 def evaluate(board: chess.Board, mobility: int) -> float:
     def evaluate(board: chess.Board, mobility: int) -> float:
@@ -155,22 +159,103 @@ def evaluate(board: chess.Board, mobility: int) -> float:
 
 
 
+def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float) -> float:
+    if time.time() - start_time > time_limit:
+        raise SearchTimeout()
+
+    stand_pat = evaluate(board, 0)
+    
+    if stand_pat >= beta:
+        return beta
+    if alpha < stand_pat:
+        alpha = stand_pat
+
+    captures = list(board.generate_legal_captures())
+    
+    for move in captures:
+        board.push(move)
+        score = -qsearch(board, -beta, -alpha, start_time, time_limit)
+        board.pop()
+
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
+
+def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_time: float, time_limit: float) -> float:
+    
+    if time.time() - start_time > time_limit:
+        raise SearchTimeout()
+
+    if depth == 0:
+        return qsearch(board, alpha, beta, start_time, time_limit)
+
+    legal_moves = list(board.legal_moves)
+    
+    if not legal_moves:
+        if board.is_check():
+            return -MATE_SCORE + len(board.move_stack)
+        return 0.0
+
+    legal_moves.sort(key=lambda m: (board.is_capture(m), m.promotion is not None), reverse=True)
+
+    best_score = -float('inf')
+
+    for move in legal_moves:
+        board.push(move)
+        score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit)
+        board.pop()
+
+        if score > best_score:
+            best_score = score
+        if best_score > alpha:
+            alpha = best_score
+        if alpha >= beta:
+            break
+
+    return best_score
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
-    """Return a legal move in UCI notation.
-
-    fen           the position to move in; your colour is the side to move
-    time_left_ms  your clock before this move, in milliseconds
-    returns       "e2e4", or "e7e8q" for a promotion
-
-    The process stays alive between your moves, so state you keep on a module or in a
-    closure survives to the next call. It does not survive to the next game.
-
-    print() is safe. Your stdout is redirected away from the protocol stream, discarded
-    during rated games and shown back to you in the validation log.
-    """
     board = chess.Board(fen)
+    start_time = time.time()
+    
+    time_limit_sec = (time_left_ms / 1000.0) / 25.0
+    if time_limit_sec < 0.1:
+        time_limit_sec = 0.1 
 
-    # Everything from here down is yours to replace. baselines/greedy searches one ply,
-    # baselines/minimax searches two. Neither is strong. Reading them is the fastest way
-    # to see the shape of a search, and beating them is the first real milestone.
-    return random.choice(list(board.legal_moves)).uci()
+    moves = list(board.legal_moves)
+    if not moves:
+        return ""
+    
+    best_move = moves[0]
+
+    try:
+        for depth in range(1, 20):
+            alpha = -float('inf')
+            beta = float('inf')
+            best_score = -float('inf')
+            
+            moves.sort(key=lambda m: (board.is_capture(m), m.promotion is not None), reverse=True)
+            current_best_move = moves[0]
+
+            for move in moves:
+                board.push(move)
+                score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit_sec)
+                board.pop()
+
+                if score > best_score:
+                    best_score = score
+                    current_best_move = move
+                if best_score > alpha:
+                    alpha = best_score
+
+            best_move = current_best_move
+            
+    except SearchTimeout:
+        pass
+
+    return best_move.uci()
