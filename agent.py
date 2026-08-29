@@ -87,12 +87,33 @@ PST_MAP = {
 # Load weights and build tables out here, not inside get_move.
 
 def evaluate(board: chess.Board, mobility: int) -> float:
-    mover = board.turn
-    material = sum(
-        value * (len(board.pieces(piece, mover)) - len(board.pieces(piece, not mover)))
-        for piece, value in PIECE_VALUE.items()
-    )
-    return material + MOBILITY_WEIGHT * mobility
+    def evaluate(board: chess.Board, mobility: int) -> float:
+    
+        if board.is_checkmate():
+            return -MATE
+        if board.is_stalemate() or board.is_insufficient_material() or board.is_repetition():
+            return 0.0
+
+        score = 0.0
+
+        for piece_type in PIECE_VALUE:
+            white_pieces = board.pieces(piece_type, chess.WHITE)
+            for sq in white_pieces:
+                score += PIECE_VALUE[piece_type]
+                score += PST_MAP[piece_type][sq]
+                
+            black_pieces = board.pieces(piece_type, chess.BLACK)
+            for sq in black_pieces:
+                score -= PIECE_VALUE[piece_type]
+                score -= PST_MAP[piece_type][chess.square_mirror(sq)]
+
+        if board.turn == chess.BLACK:
+            score = -score
+
+     
+        score += MOBILITY_WEIGHT * mobility
+
+        return score
 
 
 
