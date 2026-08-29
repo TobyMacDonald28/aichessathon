@@ -83,6 +83,13 @@ PST_MAP = {
     chess.QUEEN: [0] * 64 
 }
 
+MASK_64 = 0xFFFFFFFFFFFFFFFF
+
+NOT_A_FILE = ~chess.BB_FILE_A & MASK_64
+NOT_H_FILE = ~chess.BB_FILE_H & MASK_64
+
+PASSED_PAWN_BONUS = [0, 40, 50, 50, 75, 120, 200, 0]
+
 # Import time runs once per game, inside a 60 second budget, before your clock starts.
 # Load weights and build tables out here, not inside get_move.
 
@@ -96,6 +103,32 @@ def evaluate(board: chess.Board, mobility: int) -> float:
 
         score = 0.0
 
+        white_pawns = board.pieces_mask(chess.PAWN, chess.WHITE)
+        black_pawns = board.pieces_mask(chess.PAWN, chess.BLACK)
+
+        b_span = black_pawns
+        b_span |= (b_span >> 8)
+        b_span |= (b_span >> 16)
+        b_span |= (b_span >> 32)
+        
+        b_stop_zone = b_span | ((b_span & NOT_A_FILE) >> 1) | ((b_span & NOT_H_FILE) << 1)
+        
+        white_passed = white_pawns & ~b_stop_zone
+        
+        w_span = white_pawns
+        w_span = (w_span | (w_span << 8)) & MASK_64
+        w_span = (w_span | (w_span << 16)) & MASK_64
+        w_span = (w_span | (w_span << 32)) & MASK_64
+        
+        w_stop_zone = w_span | ((w_span & NOT_A_FILE) >> 1) | ((w_span & NOT_H_FILE) << 1)
+        black_passed = black_pawns & ~w_stop_zone
+
+        for sq in chess.SquareSet(white_passed):
+            score += PASSED_PAWN_BONUS[chess.square_rank(sq)]
+            
+        for sq in chess.SquareSet(black_passed):
+            score -= PASSED_PAWN_BONUS[7 - chess.square_rank(sq)]
+
         for piece_type in PIECE_VALUE:
             white_pieces = board.pieces(piece_type, chess.WHITE)
             for sq in white_pieces:
@@ -106,6 +139,11 @@ def evaluate(board: chess.Board, mobility: int) -> float:
             for sq in black_pieces:
                 score -= PIECE_VALUE[piece_type]
                 score -= PST_MAP[piece_type][chess.square_mirror(sq)]
+
+        if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2:
+            score += 50
+        if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2:
+            score -= 50
 
         if board.turn == chess.BLACK:
             score = -score
