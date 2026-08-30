@@ -93,69 +93,73 @@ NOT_H_FILE = ~chess.BB_FILE_H & MASK_64
 
 PASSED_PAWN_BONUS = [0, 40, 50, 50, 75, 120, 200, 0]
 
+GAME_HISTORY = set()
+
 class SearchTimeout(Exception):
     pass
 
 
 def evaluate(board: chess.Board, mobility: int) -> float:
-    def evaluate(board: chess.Board, mobility: int) -> float:
     
-        if board.is_checkmate():
-            return -MATE
-        if board.is_stalemate() or board.is_insufficient_material() or board.is_repetition():
-            return 0.0
+    if board.is_checkmate():
+        return -MATE
+    if board.is_stalemate() or board.is_insufficient_material() or board.is_repetition():
+        return 0.0
 
-        score = 0.0
+    if board._transposition_key() in GAME_HISTORY:
+        return 0.0
 
-        white_pawns = board.pieces_mask(chess.PAWN, chess.WHITE)
-        black_pawns = board.pieces_mask(chess.PAWN, chess.BLACK)
+    score = 0.0
 
-        b_span = black_pawns
-        b_span |= (b_span >> 8)
-        b_span |= (b_span >> 16)
-        b_span |= (b_span >> 32)
-        
-        b_stop_zone = b_span | ((b_span & NOT_A_FILE) >> 1) | ((b_span & NOT_H_FILE) << 1)
-        
-        white_passed = white_pawns & ~b_stop_zone
-        
-        w_span = white_pawns
-        w_span = (w_span | (w_span << 8)) & MASK_64
-        w_span = (w_span | (w_span << 16)) & MASK_64
-        w_span = (w_span | (w_span << 32)) & MASK_64
-        
-        w_stop_zone = w_span | ((w_span & NOT_A_FILE) >> 1) | ((w_span & NOT_H_FILE) << 1)
-        black_passed = black_pawns & ~w_stop_zone
+    white_pawns = board.pieces_mask(chess.PAWN, chess.WHITE)
+    black_pawns = board.pieces_mask(chess.PAWN, chess.BLACK)
 
-        for sq in chess.SquareSet(white_passed):
-            score += PASSED_PAWN_BONUS[chess.square_rank(sq)]
+    b_span = black_pawns
+    b_span |= (b_span >> 8)
+    b_span |= (b_span >> 16)
+    b_span |= (b_span >> 32)
+    
+    b_stop_zone = b_span | ((b_span & NOT_A_FILE) >> 1) | ((b_span & NOT_H_FILE) << 1)
+    
+    white_passed = white_pawns & ~b_stop_zone
+    
+    w_span = white_pawns
+    w_span = (w_span | (w_span << 8)) & MASK_64
+    w_span = (w_span | (w_span << 16)) & MASK_64
+    w_span = (w_span | (w_span << 32)) & MASK_64
+    
+    w_stop_zone = w_span | ((w_span & NOT_A_FILE) >> 1) | ((w_span & NOT_H_FILE) << 1)
+    black_passed = black_pawns & ~w_stop_zone
+
+    for sq in chess.SquareSet(white_passed):
+        score += PASSED_PAWN_BONUS[chess.square_rank(sq)]
+        
+    for sq in chess.SquareSet(black_passed):
+        score -= PASSED_PAWN_BONUS[7 - chess.square_rank(sq)]
+
+    for piece_type in PIECE_VALUE:
+        white_pieces = board.pieces(piece_type, chess.WHITE)
+        for sq in white_pieces:
+            score += PIECE_VALUE[piece_type]
+            score += PST_MAP[piece_type][sq]
             
-        for sq in chess.SquareSet(black_passed):
-            score -= PASSED_PAWN_BONUS[7 - chess.square_rank(sq)]
+        black_pieces = board.pieces(piece_type, chess.BLACK)
+        for sq in black_pieces:
+            score -= PIECE_VALUE[piece_type]
+            score -= PST_MAP[piece_type][chess.square_mirror(sq)]
 
-        for piece_type in PIECE_VALUE:
-            white_pieces = board.pieces(piece_type, chess.WHITE)
-            for sq in white_pieces:
-                score += PIECE_VALUE[piece_type]
-                score += PST_MAP[piece_type][sq]
-                
-            black_pieces = board.pieces(piece_type, chess.BLACK)
-            for sq in black_pieces:
-                score -= PIECE_VALUE[piece_type]
-                score -= PST_MAP[piece_type][chess.square_mirror(sq)]
+    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2:
+        score += 50
+    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2:
+        score -= 50
 
-        if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2:
-            score += 50
-        if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2:
-            score -= 50
+    if board.turn == chess.BLACK:
+        score = -score
 
-        if board.turn == chess.BLACK:
-            score = -score
+    
+    score += MOBILITY_WEIGHT * mobility
 
-     
-        score += MOBILITY_WEIGHT * mobility
-
-        return score
+    return score
 
 
 
@@ -222,6 +226,11 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
 def get_move(fen: str, time_left_ms: int) -> str:
     board = chess.Board(fen)
     start_time = time.time()
+
+    if board.halfmove_clock == 0:
+        GAME_HISTORY.clear()
+        
+    GAME_HISTORY.add(board._transposition_key())
     
     time_limit_sec = (time_left_ms / 1000.0) / 25.0
     if time_limit_sec < 0.1:
