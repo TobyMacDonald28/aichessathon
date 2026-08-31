@@ -139,8 +139,19 @@ TT = {}
 KILLERS_PER_DEPTH = 2
 KILLERS: dict[int, list[chess.Move]] = {}
 
+SAFETY_MARGIN_MS = 50.0
+MIN_TIME_LIMIT_SEC = 0.05
+
 class SearchTimeout(Exception):
     pass
+
+def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
+
+    expected_moves_left = max(20, 60 - board.fullmove_number)
+    usable_ms = max(time_left_ms - SAFETY_MARGIN_MS, 0.0)
+    budget_sec = max(usable_ms / 1000.0 / expected_moves_left, MIN_TIME_LIMIT_SEC)
+
+    return min(budget_sec, time_left_ms / 1000.0 * 0.5)
 
 def store_killer(depth: int, move: chess.Move) -> None:
     slots = KILLERS.setdefault(depth, [])
@@ -349,7 +360,7 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
     return best_score
 
 def get_move(fen: str, time_left_ms: int) -> str:
-    global GAME_HISTORY, TT
+    global GAME_HISTORY, TT, KILLERS
 
     board = chess.Board(fen)
     start_time = time.time()
@@ -370,13 +381,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
     base_path_keys = set(GAME_HISTORY.keys())
     
     if len(TT) > 1000000:
-        TT.clear()
+        TT = {}
 
-    KILLERS.clear()
+    KILLERS = {}
 
-    time_limit_sec = (time_left_ms / 1000.0) / 25.0
-    if time_limit_sec < 0.1:
-        time_limit_sec = 0.1 
+    time_limit_sec = time_budget_sec(time_left_ms, board)
 
     moves = list(board.legal_moves)
     if not moves:
