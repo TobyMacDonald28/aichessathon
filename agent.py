@@ -141,6 +141,25 @@ def evaluate(board: chess.Board, mobility: int) -> float:
     score += MOBILITY_WEIGHT * mobility
     return score
 
+def score_move(board: chess.Board, move: chess.Move, tt_move_uci: str = None) -> float:
+    if tt_move_uci and move.uci() == tt_move_uci:
+        return 1000000.0 
+
+    score = 0.0
+    if move.promotion:
+        score += 90000.0 + PIECE_VALUE.get(move.promotion, 0)
+        
+    if board.is_capture(move):
+        victim = board.piece_at(move.to_square)
+        attacker = board.piece_at(move.from_square)
+        
+        victim_val = PIECE_VALUE.get(victim.piece_type, 100.0) if victim else 100.0
+        attacker_val = PIECE_VALUE.get(attacker.piece_type, 100.0) if attacker else 100.0
+        
+        score += 10000.0 + victim_val - (attacker_val / 100.0)
+        
+    return score
+
 def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
