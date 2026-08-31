@@ -1,9 +1,11 @@
 """The submission entrypoint. The platform imports this file and calls get_move."""
 
 import random
+import sys
 import time
 import chess
 from collections import Counter
+import chess.polyglot
 
 PIECE_VALUE = {
     chess.PAWN: 100.0,
@@ -87,11 +89,6 @@ NOT_H_FILE = ~chess.BB_FILE_H & MASK_64
 
 PASSED_PAWN_BONUS = [0, 40, 50, 50, 75, 120, 200, 0]
 
-OPENING_BOOK = {
-    chess.STARTING_FEN: ["e2e4", "d2d4", "c2c4", "g1f3"],
-    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1": ["c7c5", "e7e5", "e7e6", "c7c6"], 
-    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1": ["d7d5", "g8f6", "e7e6"]
-}
 
 GAME_HISTORY = Counter()
 TT = {} 
@@ -232,12 +229,16 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
 
 def get_move(fen: str, time_left_ms: int) -> str:
     global GAME_HISTORY, TT
-    
-    if fen in OPENING_BOOK:
-        return random.choice(OPENING_BOOK[fen])
 
     board = chess.Board(fen)
     start_time = time.time()
+    try:
+        with chess.polyglot.open_reader("book.bin") as reader:
+            book_entry = reader.choice(board)
+            move_uci = book_entry.move.uci()
+            return move_uci
+    except (FileNotFoundError, IndexError):
+        pass
 
     if board.halfmove_clock == 0:
         GAME_HISTORY.clear()

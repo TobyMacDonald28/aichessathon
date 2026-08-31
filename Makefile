@@ -8,8 +8,9 @@ setup:
 play:
 	uv run python -m harness.play --white . --black baselines/greedy $(if $(FEN),--fen "$(FEN)")
 
+
 arena:
-	uv run python -m harness.arena --opponent baselines/greedy --games 20
+	uv run python -m harness.arena --opponent baselines/v1 --games 20
 
 zip:
 	uv run python -m harness.package
