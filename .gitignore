@@ -4,3 +4,7 @@ __pycache__/
 .ruff_cache/
 submission.zip
 *.pgn
+
+# training data/weights: large, regenerable via mlp/train.py, not meant to be committed
+mlp/data/
+mlp/weights.pt
