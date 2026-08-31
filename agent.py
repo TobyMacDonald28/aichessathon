@@ -135,10 +135,19 @@ PASSED_PAWN_BONUS = [0, 40, 50, 50, 75, 120, 200, 0]
 
 
 GAME_HISTORY = Counter()
-TT = {} 
+TT = {}
+KILLERS_PER_DEPTH = 2
+KILLERS: dict[int, list[chess.Move]] = {}
 
 class SearchTimeout(Exception):
     pass
+
+def store_killer(depth: int, move: chess.Move) -> None:
+    slots = KILLERS.setdefault(depth, [])
+    if move in slots:
+        return
+    slots.insert(0, move)
+    del slots[KILLERS_PER_DEPTH:]
 
 def evaluate(board: chess.Board, mobility: int) -> float:
     if board.is_checkmate():
@@ -204,23 +213,30 @@ def evaluate(board: chess.Board, mobility: int) -> float:
     score += MOBILITY_WEIGHT * mobility
     return score
 
-def score_move(board: chess.Board, move: chess.Move, tt_move_uci: str = None) -> float:
+def score_move(
+    board: chess.Board,
+    move: chess.Move,
+    tt_move_uci: str | None = None,
+    killers: list[chess.Move] | None = None,
+) -> float:
     if tt_move_uci and move.uci() == tt_move_uci:
-        return 1000000.0 
+        return 1000000.0
 
     score = 0.0
     if move.promotion:
         score += 90000.0 + PIECE_VALUE.get(move.promotion, 0)
-        
+
     if board.is_capture(move):
         victim = board.piece_at(move.to_square)
         attacker = board.piece_at(move.from_square)
-        
+
         victim_val = PIECE_VALUE.get(victim.piece_type, 100.0) if victim else 100.0
         attacker_val = PIECE_VALUE.get(attacker.piece_type, 100.0) if attacker else 100.0
-        
+
         score += 10000.0 + victim_val - (attacker_val / 100.0)
-        
+    elif killers and move in killers:
+        score += 9000.0
+
     return score
 
 def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float) -> float:
@@ -297,7 +313,8 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
             return -MATE_SCORE + len(board.move_stack)
         return 0.0
 
-    legal_moves.sort(key=lambda m: score_move(board, m, tt_move_uci), reverse=True)
+    killers = KILLERS.get(depth)
+    legal_moves.sort(key=lambda m: score_move(board, m, tt_move_uci, killers), reverse=True)
 
     best_score = -float('inf')
     best_move_for_tt = None
@@ -311,10 +328,12 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
         if score > best_score:
             best_score = score
             best_move_for_tt = move.uci() # Remember the move that gave us the best score
-            
+
         if best_score > alpha:
             alpha = best_score
         if alpha >= beta:
+            if not board.is_capture(move) and move.promotion is None:
+                store_killer(depth, move)
             break
 
     path_keys.remove(key)
@@ -352,7 +371,9 @@ def get_move(fen: str, time_left_ms: int) -> str:
     
     if len(TT) > 1000000:
         TT.clear()
-    
+
+    KILLERS.clear()
+
     time_limit_sec = (time_left_ms / 1000.0) / 25.0
     if time_limit_sec < 0.1:
         time_limit_sec = 0.1 
