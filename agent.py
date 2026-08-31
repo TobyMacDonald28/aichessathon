@@ -172,7 +172,7 @@ def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, ti
         alpha = stand_pat
 
     captures = list(board.generate_legal_captures())
-    captures.sort(key=lambda m: m.promotion is not None, reverse=True)
+    captures.sort(key=lambda m: score_move(board, m), reverse=True)
     
     for move in captures:
         board.push(move)
@@ -192,23 +192,41 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
 
     key = board._transposition_key()
     
+    # 1. Draw detection
     if GAME_HISTORY[key] >= 2 or key in path_keys:
         return 0.0
 
     alpha_orig = alpha
-    if key in TT and TT[key]['depth'] >= depth:
+    tt_move_uci = None
+    
+    # 2. Transposition Table Probe
+    if key in TT:
         tt_entry = TT[key]
-        if tt_entry['flag'] == 'EXACT':
-            return tt_entry['score']
-        elif tt_entry['flag'] == 'LOWER':
-            alpha = max(alpha, tt_entry['score'])
-        elif tt_entry['flag'] == 'UPPER':
-            beta = min(beta, tt_entry['score'])
-        if alpha >= beta:
-            return tt_entry['score']
+        tt_move_uci = tt_entry.get('best_move') # Extract the best move to sort it first later
+        
+        if tt_entry['depth'] >= depth:
+            if tt_entry['flag'] == 'EXACT':
+                return tt_entry['score']
+            elif tt_entry['flag'] == 'LOWER':
+                alpha = max(alpha, tt_entry['score'])
+            elif tt_entry['flag'] == 'UPPER':
+                beta = min(beta, tt_entry['score'])
+            if alpha >= beta:
+                return tt_entry['score']
 
     if depth == 0:
         return qsearch(board, alpha, beta, start_time, time_limit)
+
+    # 3. Null Move Pruning (NMP)
+    # If we have depth, aren't in check, and it's not a late endgame (avoiding zugzwang)
+    if depth >= 3 and beta < MATE_SCORE and not board.is_check() and len(board.piece_map()) > 10:
+        board.push(chess.Move.null())
+        # Search with reduced depth (R=2) and a zero-window
+        null_score = -negamax(board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys)
+        board.pop()
+        
+        if null_score >= beta:
+            return beta # Prune this branch immediately
 
     legal_moves = list(board.legal_moves)
     if not legal_moves:
@@ -216,10 +234,10 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
             return -MATE_SCORE + len(board.move_stack)
         return 0.0
 
-    legal_moves.sort(key=lambda m: (board.is_capture(m), m.promotion is not None), reverse=True)
+    legal_moves.sort(key=lambda m: score_move(board, m, tt_move_uci), reverse=True)
 
     best_score = -float('inf')
-
+    best_move_for_tt = None
     path_keys.add(key)
 
     for move in legal_moves:
@@ -229,6 +247,8 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
 
         if score > best_score:
             best_score = score
+            best_move_for_tt = move.uci() # Remember the move that gave us the best score
+            
         if best_score > alpha:
             alpha = best_score
         if alpha >= beta:
@@ -242,7 +262,7 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
     elif best_score >= beta:
         flag = 'LOWER'
         
-    TT[key] = {'depth': depth, 'score': best_score, 'flag': flag}
+    TT[key] = {'depth': depth, 'score': best_score, 'flag': flag, 'best_move': best_move_for_tt}
 
     return best_score
 
@@ -267,7 +287,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     base_path_keys = set(GAME_HISTORY.keys())
     
-    TT.clear() 
+    if len(TT) > 1000000:
+        TT.clear()
     
     time_limit_sec = (time_left_ms / 1000.0) / 25.0
     if time_limit_sec < 0.1:
