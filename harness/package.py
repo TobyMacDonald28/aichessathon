@@ -3,14 +3,23 @@ import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
-DEFAULT_INCLUDES = ("agent.py", "requirements.txt", "weights")
+from harness.rules import MAX_UNZIPPED_BYTES
+
+DEFAULT_INCLUDES = ("weights",)
 SKIP = {"__pycache__", ".DS_Store"}
 
 
 def members(root: Path, includes: tuple[str, ...]) -> Iterator[tuple[Path, str]]:
+    named: set[str] = set()
+    for path in sorted(root.glob("*.py")):
+        named.add(path.name)
+        yield path, path.name
     for name in includes:
+        if name in named:
+            continue
         source = root / name
         if source.is_file():
+            named.add(name)
             yield source, name
         elif source.is_dir():
             for path in sorted(source.rglob("*")):
@@ -19,13 +28,13 @@ def members(root: Path, includes: tuple[str, ...]) -> Iterator[tuple[Path, str]]
 
 
 def build(root: Path, destination: Path, includes: tuple[str, ...]) -> list[str]:
-    written: list[str] = []
-    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
-        for source, name in members(root, includes):
-            archive.write(source, name)
-            written.append(name)
+    entries = list(members(root, includes))
+    written = [name for _, name in entries]
     if "agent.py" not in written:
         raise SystemExit(f"{root / 'agent.py'} does not exist; the platform imports it by name")
+    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
+        for source, name in entries:
+            archive.write(source, name)
     return written
 
 
@@ -36,11 +45,19 @@ def main() -> None:
     arguments = parser.parse_args()
 
     includes = DEFAULT_INCLUDES + tuple(arguments.include)
-    written = build(Path.cwd(), arguments.out, includes)
+    root = Path.cwd()
+    written = build(root, arguments.out, includes)
     size = arguments.out.stat().st_size
-    print(f"{arguments.out} ({size:,} bytes)")
+    unzipped = sum((root / name).stat().st_size for name in written)
+    print(f"{arguments.out} ({size:,} bytes, {unzipped:,} unzipped)")
     for name in written:
         print(f"  {name}")
+    if unzipped > MAX_UNZIPPED_BYTES:
+        over = unzipped / MAX_UNZIPPED_BYTES
+        print(
+            f"\nwarning: {unzipped / 1024 / 1024:.1f} MB unzipped is {over:.1f}x the "
+            f"{MAX_UNZIPPED_BYTES // 1024 // 1024} MB limit. The platform will reject this upload"
+        )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ answer anything about limits, deadlines, or what is allowed:
 - https://aichessathon.com/docs/agent-contract.md
 - https://aichessathon.com/docs/rules.md
 
-There is no copy of either in this repo on purpose. Fetch the URLs.
+The quick reference below is a convenience for common questions. The two URLs are canonical
+and they change, so fetch them before you rely on a number.
 
 ## The contract, in one place
 
@@ -23,7 +24,14 @@ There is no copy of either in this repo on purpose. Fetch the URLs.
   your next move in the same game, never to the next game.
 - Import time has a 60 second budget before the clock starts. Load weights there.
 - 120 s + 0.5 s per move, per side, on wall time. One core, 2 GB, no network, no GPU.
-- Illegal move, malformed output, crash, out of memory, or flag fall loses that game.
+- Illegal move, malformed output, crash, out of memory, or flag fall loses that game. A move
+  reply over 4 KB counts as illegal. 300 plies without a result goes to material adjudication.
+- Everything in the zip together stays under 50 MB unzipped.
+- Six uploads per team per day, and the latest one that passed validation is the one that plays.
+- Rated games start from curated opening positions, not the standard start. The set is not
+  published.
+- The process keeps its core while the opponent thinks, so pondering on their time is allowed.
+  Two of your games can run at once, in separate containers.
 
 ## Things that break agents here
 
@@ -33,17 +41,24 @@ There is no copy of either in this repo on purpose. Fetch the URLs.
 - One core. `torch.set_num_threads(1)`. More threads lose time rather than winning it.
 - Your zip is first on `sys.path`. Never name a file after a module you import: `chess.py`,
   `types.py`, `random.py` will shadow the real one and the failure will look unrelated.
-- `requirements.txt` takes plain package names and version specifiers only. No URLs, no index
-  options, no local wheels, and only packages with a Linux wheel on PyPI.
-- Native binaries in the zip are rejected. Ship source; take compiled code from public packages.
+- The environment is fixed. The platform preinstalls torch 2.13 (CPU), numpy 2.5, python-chess
+  1.11, onnxruntime 1.29 and numba 0.67 and installs nothing else. A `requirements.txt` is
+  ignored, so an import outside that stack crashes on the platform even when it works locally.
+  Additions can be requested at hello@aichessathon.com.
+- Native binaries in the zip are rejected. Ship Python source. Model weights like `.onnx`,
+  `.safetensors` and `.pt` are fine, and any model shipped must be one the team trained.
+- numba is how Python gets fast here. Warm every jitted function once at import so compilation
+  lands in the init budget, not on the clock. Cython does not work on the platform.
 - `print` is safe. The runner points file descriptor 1 at stderr before importing the agent, so
   nothing you write can corrupt the protocol. It is discarded in rated games and shown in the
   validation log.
 
 ## Do not
 
-- Do not use Stockfish, Lc0, Maia, or any existing engine, in any form, including a pip package
-  that embeds one. It is an instant disqualification and it is checked after the fact.
+- Do not use Stockfish, Lc0, Maia, or any existing engine inside the submission, including a
+  pip package that embeds one. It is an instant disqualification and it is checked after the
+  fact. Training on data an engine annotated is allowed; the ban covers what ships and runs
+  inside the zip.
 - Do not add network calls, subprocess calls to external binaries, or anything that reads outside
   the agent directory and `/tmp`.
 - Do not obfuscate. What ships has to be source a judge can read.

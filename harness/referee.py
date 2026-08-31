@@ -24,19 +24,24 @@ class Outcome:
 
 
 def play_match(
-    white: Agent, black: Agent, base_ms: int, increment_ms: int, ply_cap: int = PLY_CAP
+    white: Agent,
+    black: Agent,
+    base_ms: int,
+    increment_ms: int,
+    ply_cap: int = PLY_CAP,
+    start_fen: str = chess.STARTING_FEN,
 ) -> Outcome:
     try:
-        return _play(white, black, base_ms, increment_ms, ply_cap)
+        return _play(white, black, base_ms, increment_ms, ply_cap, start_fen)
     finally:
         white.stop()
         black.stop()
 
 
 def _play(
-    white: Agent, black: Agent, base_ms: int, increment_ms: int, ply_cap: int
+    white: Agent, black: Agent, base_ms: int, increment_ms: int, ply_cap: int, start_fen: str
 ) -> Outcome:
-    board = chess.Board()
+    board = chess.Board(start_fen)
     agents = {chess.WHITE: white, chess.BLACK: black}
 
     white_failure = _start(white)

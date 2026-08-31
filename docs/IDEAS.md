@@ -1,7 +1,8 @@
 # Where the strength comes from
 
-The rules require that a learned model materially drives move selection, so the shape of a
-competitive agent is a search that calls a model. This is what tends to matter, roughly in order.
+A model is optional. Material plus piece-square tables is a legal entry, and the winning
+shape is usually a search that calls a small evaluation, learned or not. This is what tends to
+matter, roughly in order.
 
 ## Search
 
@@ -19,7 +20,12 @@ respectable is mostly move ordering, because alpha-beta only pays off when good 
 
 You are on one core in Python, so node counts are small: expect thousands, not millions. That
 changes the trade. Depth is expensive, so evaluation quality and ordering buy more than they
-would in a C engine.
+would in a C engine. numba closes most of that gap: the platform preinstalls it, and a jitted
+movegen and evaluation reach node counts pure Python cannot. Warm every jitted function once at
+import so compilation happens inside the init budget, and warm it with the argument types the
+real calls use, since numba compiles per signature. `baselines/numba` shows the pattern. Note
+that it scores barely better than `baselines/minimax`, because jitting a two-ply search wins
+nothing on its own. The gain is the depth the speed lets you afford.
 
 ## Evaluation
 
@@ -34,12 +40,18 @@ you can evaluate fifty times.
 Batching helps: collect the leaf positions of a search pass and evaluate them in one call rather
 than one at a time.
 
+Size a learned evaluation like the CPU engine nets. An NNUE-style net quantised to int8 or int16
+lands between 1 and 40 MB and is fast enough to search with. A deep convolutional net at fp32
+manages a few hundred evaluations a second on one core, which is a policy model's budget, not a
+search evaluation's.
+
 ## Training data
 
-You have no network at runtime, so everything ships in the zip inside the 200 MB budget. Data
+You have no network at runtime, so everything ships in the zip inside the 50 MB cap. Data
 gathering happens on your machine, before you upload. Public game databases and self-play against
-your own earlier versions are both reasonable starting points. Whatever you train on, the model
-has to be yours.
+your own earlier versions are both reasonable starting points, and labelling positions with an
+existing engine is explicitly allowed: the ban covers what ships inside the zip, not what you
+learn from. Whatever you train on, the model has to be one you trained.
 
 ## Time management
 
@@ -59,8 +71,10 @@ The process stays alive between your moves, so you can keep state. Two things ar
   so if you are winning and shuffling, you can draw a won game without ever being told.
 - Your own search results. A transposition table that survives across moves is a real gain.
 
-An opening book, even twenty lines deep, saves clock and avoids the early blunders that cost more
-than any evaluation improvement.
+An opening book is worth less here than it looks. Rated games start from curated positions
+rather than the standard start, so a book keyed on move one is often already out of book. Test
+with `make play FEN=...` from positions you have not prepared, and spend the effort on the search
+instead.
 
 ## Measuring a change
 
@@ -75,5 +89,5 @@ fast time control is how you get them. Keep the previous version around as an op
 - Crashing on an edge case: no legal moves, a promotion, an en passant capture. Play a few hundred
   games against a random baseline and the rare paths show up.
 - Blowing the 60 second import budget loading weights.
-- Writing outside `/tmp`, which is read-only and will not be what you expect.
+- Writing anywhere but `/tmp`. Everything else is read-only.
 - More threads than cores. `torch.set_num_threads(1)`.
