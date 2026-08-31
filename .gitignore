@@ -7,4 +7,4 @@ submission.zip
 
 # training data/weights: large, regenerable via mlp/train.py, not meant to be committed
 mlp/data/
-mlp/weights.pt
+mlp/weights*.pt
