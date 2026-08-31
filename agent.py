@@ -74,14 +74,58 @@ KING_PST = [
     -30,-40,-40,-50,-50,-40,-40,-30
 ]
 
-PST_MAP = {
+# Endgame-only tables: the king wants to be active/central once the queens and
+# rooks are off, and passed pawns matter far more than opening-square nuance.
+KING_PST_EG = [
+    -50,-40,-30,-20,-20,-30,-40,-50,
+    -30,-20,-10,  0,  0,-10,-20,-30,
+    -30,-10, 20, 30, 30, 20,-10,-30,
+    -30,-10, 30, 40, 40, 30,-10,-30,
+    -30,-10, 30, 40, 40, 30,-10,-30,
+    -30,-10, 20, 30, 30, 20,-10,-30,
+    -30,-30,  0,  0,  0,  0,-30,-30,
+    -50,-30,-30,-30,-30,-30,-30,-50
+]
+
+PAWN_PST_EG = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+    10, 10, 10, 10, 10, 10, 10, 10,
+    10, 10, 10, 10, 10, 10, 10, 10,
+    20, 20, 20, 20, 20, 20, 20, 20,
+    30, 30, 30, 30, 30, 30, 30, 30,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    80, 80, 80, 80, 80, 80, 80, 80,
+     0,  0,  0,  0,  0,  0,  0,  0
+]
+
+PST_MG = {
     chess.PAWN: PAWN_PST,
     chess.KNIGHT: KNIGHT_PST,
     chess.BISHOP: BISHOP_PST,
     chess.ROOK: ROOK_PST,
     chess.KING: KING_PST,
-    chess.QUEEN: [0] * 64 
+    chess.QUEEN: [0] * 64
 }
+
+PST_EG = {
+    chess.PAWN: PAWN_PST_EG,
+    chess.KNIGHT: KNIGHT_PST,
+    chess.BISHOP: BISHOP_PST,
+    chess.ROOK: ROOK_PST,
+    chess.KING: KING_PST_EG,
+    chess.QUEEN: [0] * 64
+}
+
+# Tapered-eval phase weights (classic PeSTO scheme): sum of these over every
+# knight/bishop/rook/queen still on the board, per side, maxes out at 24 when
+# both armies are at full strength and falls to 0 in a bare-king endgame.
+PHASE_WEIGHTS = {
+    chess.KNIGHT: 1,
+    chess.BISHOP: 1,
+    chess.ROOK: 2,
+    chess.QUEEN: 4,
+}
+MAX_PHASE = 24
 
 MASK_64 = 0xFFFFFFFFFFFFFFFF
 NOT_A_FILE = ~chess.BB_FILE_A & MASK_64
@@ -126,11 +170,30 @@ def evaluate(board: chess.Board, mobility: int) -> float:
     for sq in chess.SquareSet(black_passed):
         score -= PASSED_PAWN_BONUS[7 - chess.square_rank(sq)]
 
+    mg_score = 0.0
+    eg_score = 0.0
+    phase = 0
+
     for piece_type in PIECE_VALUE:
         for sq in board.pieces(piece_type, chess.WHITE):
-            score += PIECE_VALUE[piece_type] + PST_MAP[piece_type][sq]
+            mg_score += PIECE_VALUE[piece_type] + PST_MG[piece_type][sq]
+            eg_score += PIECE_VALUE[piece_type] + PST_EG[piece_type][sq]
+            phase += PHASE_WEIGHTS.get(piece_type, 0)
         for sq in board.pieces(piece_type, chess.BLACK):
-            score -= PIECE_VALUE[piece_type] + PST_MAP[piece_type][chess.square_mirror(sq)]
+            mg_score -= PIECE_VALUE[piece_type] + PST_MG[piece_type][chess.square_mirror(sq)]
+            eg_score -= PIECE_VALUE[piece_type] + PST_EG[piece_type][chess.square_mirror(sq)]
+            phase += PHASE_WEIGHTS.get(piece_type, 0)
+
+    for sq in board.pieces(chess.KING, chess.WHITE):
+        mg_score += PST_MG[chess.KING][sq]
+        eg_score += PST_EG[chess.KING][sq]
+    for sq in board.pieces(chess.KING, chess.BLACK):
+        mg_score -= PST_MG[chess.KING][chess.square_mirror(sq)]
+        eg_score -= PST_EG[chess.KING][chess.square_mirror(sq)]
+
+    mg_phase = min(phase, MAX_PHASE)
+    eg_phase = MAX_PHASE - mg_phase
+    score += (mg_score * mg_phase + eg_score * eg_phase) / MAX_PHASE
 
     if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 50
     if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 50
