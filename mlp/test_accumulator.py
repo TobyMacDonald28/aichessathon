@@ -3,7 +3,8 @@
 Run directly: `python test_accumulator.py`. Not part of the training pipeline — this exists
 because an incremental-update bug (a missed en passant capture, a castling rook, a king move
 that should have triggered a refresh) would otherwise just look like a slightly-off evaluation
-forever, not a crash.
+forever, not a crash. The accumulator is integer (int16 weight rows summed into an int32
+running total), so incremental and from-scratch must match exactly — no tolerance needed.
 """
 
 import random
@@ -16,8 +17,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from nnue import Accumulator
 from train import ACCUMULATOR_DIM, FEATURE_DIM
-
-TOLERANCE = 1e-4
 
 # Positions chosen to force specific move types soon after the game starts: castling (both
 # sides), en passant, promotion, and a capture, rather than hoping random play stumbles into them.
@@ -32,9 +31,9 @@ STRESS_FENS = [
 def assert_matches(acc: Accumulator, board: chess.Board, context: str) -> None:
     expected_white = acc._full(board, chess.WHITE)
     expected_black = acc._full(board, chess.BLACK)
-    if not np.allclose(acc.white_acc, expected_white, atol=TOLERANCE):
+    if not np.array_equal(acc.white_acc, expected_white):
         raise AssertionError(f"white accumulator mismatch {context}\nfen={board.fen()}")
-    if not np.allclose(acc.black_acc, expected_black, atol=TOLERANCE):
+    if not np.array_equal(acc.black_acc, expected_black):
         raise AssertionError(f"black accumulator mismatch {context}\nfen={board.fen()}")
 
 
@@ -73,7 +72,9 @@ def main() -> None:
 
 def rng_weight(rng: random.Random) -> np.ndarray:
     np_rng = np.random.default_rng(rng.randint(0, 2**31))
-    return np_rng.standard_normal((FEATURE_DIM + 1, ACCUMULATOR_DIM)).astype(np.float32)
+    return np_rng.integers(
+        -1000, 1000, size=(FEATURE_DIM + 1, ACCUMULATOR_DIM), dtype=np.int16
+    )
 
 
 if __name__ == "__main__":

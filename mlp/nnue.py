@@ -9,19 +9,28 @@ exception is a king move: since the king's square is the anchor every other feat
 relative to, moving it changes what all ~30 of that side's features *mean*, so that side gets a
 full recompute (still only for that one side, not both).
 
-This module also runs the small head network in plain numpy rather than torch — once the
-accumulator gives you the 512-wide vector, the rest is two tiny matmuls, and skipping torch
-avoids per-call tensor-construction overhead in the search's hot path.
+This is also where the quantized half of NNUE happens (see quantize.py for why these two tensors
+specifically): the feature transformer weight stays int16 end to end, so `Accumulator`'s push/pop
+are plain integer add/sub — no rescaling, no rounding, exact. The head's first layer (512 -> 32,
+~94% of the head's multiply-adds) runs as an int8 x int8 -> int32 dot product in `_int8_matvec`, a
+numba-jitted loop. Checked against the compiled assembly on this machine, it's a scalar
+multiply-accumulate loop, not real SIMD — LLVM's auto-vectorizer doesn't kick in for this widening
+int8->int32 reduction pattern. It's still faster than the numpy alternatives (no BLAS dispatch or
+temporary-array allocation for a matrix this small), just not for the reason that name suggests.
+The last two head layers (32 -> 32 -> 1) are cheap enough that plain float32 is fine and simpler.
 """
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import chess
+import numba
 import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
+from quantize import HEAD_BITS, QUANTIZED_KEYS, quantize_tensor
 from train import (
     ACCUMULATOR_DIM,
     PIECE_INDEX_NO_KING,
@@ -32,31 +41,112 @@ from train import (
 
 Update = tuple[int, int, bool, int]  # (square, piece_type, color, sign)
 
+# The accumulator sums up to 32 int16 weight rows (a legal position has at most 30 non-king
+# pieces). int16 alone could overflow (32 * 32767 > 32767); int32 has all the headroom needed.
+_ACC_DTYPE = np.int32
+
+
+@dataclass(slots=True)
+class NNUEWeights:
+    ft_weight: np.ndarray  # int16, (FEATURE_DIM + 1, ACCUMULATOR_DIM)
+    ft_scale: float
+    head1_weight: np.ndarray  # int8, (32, ACCUMULATOR_DIM * 2)
+    head1_scale: float
+    head1_bias: np.ndarray  # float32, (32,)
+    head3_weight: np.ndarray  # float32, (32, 32)
+    head3_bias: np.ndarray
+    head5_weight: np.ndarray  # float32, (1, 32)
+    head5_bias: np.ndarray
+
 
 # ---------------------------------------------------------------------------
-# Loading weights: dequantized (if quantized) straight to float32 numpy arrays.
-# The accumulator and head both run in float32 regardless of how the weights were
-# stored on disk — see quantize.py for why quantization only saves file size here,
-# not runtime arithmetic cost.
+# Loading weights: quantize.py's bundle format is {key: (tensor, scale)}; a plain unquantized
+# weights.pt straight out of train.py is {key: tensor}. Either way, the feature transformer and
+# head.1 come out as integer arrays here — if the file wasn't already quantized, this quantizes
+# them on the spot, so the runtime path is always integer regardless of which file gets loaded.
 # ---------------------------------------------------------------------------
 
 
-def load_weights(path: Path = WEIGHTS_PATH) -> dict[str, np.ndarray]:
+StateDict = dict[str, torch.Tensor | tuple[torch.Tensor, float]]
+
+
+def _load_integer(state: StateDict, key: str, bits: int, dtype: type) -> tuple[np.ndarray, float]:
+    value = state[key]
+    tensor, scale = value if isinstance(value, tuple) else quantize_tensor(value, bits)
+    return tensor.numpy().astype(dtype), scale
+
+
+def _load_float(state: StateDict, key: str) -> np.ndarray:
+    value = state[key]
+    tensor, scale = value if isinstance(value, tuple) else (value, 1.0)
+    return tensor.numpy().astype(np.float32) * scale
+
+
+def load_weights(path: Path = WEIGHTS_PATH) -> NNUEWeights:
     state = torch.load(path, map_location="cpu")
-    if all(isinstance(v, torch.Tensor) for v in state.values()):
-        return {k: v.numpy().astype(np.float32) for k, v in state.items()}
-    # quantize.py's bundle format: {key: (tensor, scale)}
-    return {k: (tensor.numpy().astype(np.float32) * scale) for k, (tensor, scale) in state.items()}
+
+    ft_weight, ft_scale = _load_integer(
+        state, "feature_transformer.weight", QUANTIZED_KEYS["feature_transformer.weight"], np.int16
+    )
+    head1_weight, head1_scale = _load_integer(state, "head.1.weight", HEAD_BITS, np.int8)
+
+    return NNUEWeights(
+        ft_weight=ft_weight,
+        ft_scale=ft_scale,
+        head1_weight=head1_weight,
+        head1_scale=head1_scale,
+        head1_bias=_load_float(state, "head.1.bias"),
+        head3_weight=_load_float(state, "head.3.weight"),
+        head3_bias=_load_float(state, "head.3.bias"),
+        head5_weight=_load_float(state, "head.5.weight"),
+        head5_bias=_load_float(state, "head.5.bias"),
+    )
 
 
-def head_forward(x: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
-    x = np.maximum(x, 0.0)
-    x = x @ weights["head.1.weight"].T + weights["head.1.bias"]
-    x = np.maximum(x, 0.0)
-    x = x @ weights["head.3.weight"].T + weights["head.3.bias"]
-    x = np.maximum(x, 0.0)
-    x = x @ weights["head.5.weight"].T + weights["head.5.bias"]
-    return x
+# ---------------------------------------------------------------------------
+# The int8 matvec kernel: compiled, not vectorized (see the module docstring) — still faster than
+# numpy here because it's one allocation-free loop instead of a BLAS call or numpy's generic
+# integer matmul path. An explicit signature makes numba compile eagerly, right here at import
+# time, instead of lazily on the first call during search — the 60s import budget is exactly
+# where that cost belongs. No `cache=True`: the platform's filesystem is read-only and each game
+# is a fresh process anyway, so an on-disk cache would only risk a failed write for no benefit.
+# ---------------------------------------------------------------------------
+
+
+@numba.njit("int32[:](int8[:], int8[:,:])")
+def _int8_matvec(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    out_features, in_features = weight.shape
+    out = np.zeros(out_features, dtype=np.int32)
+    for i in range(out_features):
+        acc = np.int32(0)
+        for j in range(in_features):
+            acc += np.int32(x[j]) * np.int32(weight[i, j])
+        out[i] = acc
+    return out
+
+
+def evaluate_head(x: np.ndarray, weights: NNUEWeights) -> float:
+    """x: the concatenated (stm, nstm) accumulator, int32, shape (ACCUMULATOR_DIM * 2,)."""
+    relu_x = np.maximum(x, 0)
+
+    # Requantize the int32 accumulator down to int8 for the SIMD matvec. There's no fixed
+    # activation range to calibrate against (train.py doesn't bound this layer's output), so the
+    # scale is derived per call from the actual max — cheap, since it's one reduction over 512
+    # ints, and exact for whatever range this position's activations happen to occupy.
+    act_max = max(int(relu_x.max()), 1)
+    act_scale = act_max / 127.0
+    x_i8 = np.minimum(np.round(relu_x / act_scale), 127).astype(np.int8)
+
+    h1_i32 = _int8_matvec(x_i8, weights.head1_weight)
+    combined_scale = np.float32(act_scale * weights.ft_scale * weights.head1_scale)
+    h1 = h1_i32.astype(np.float32) * combined_scale + weights.head1_bias
+    h1 = np.maximum(h1, 0.0)
+
+    h2 = h1 @ weights.head3_weight.T + weights.head3_bias
+    h2 = np.maximum(h2, 0.0)
+
+    out = h2 @ weights.head5_weight.T + weights.head5_bias
+    return float(out[0])
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +210,9 @@ class Accumulator:
     drift out of sync: every push/pop goes through here instead of `board.push`/`board.pop`."""
 
     def __init__(self, weight: np.ndarray) -> None:
-        self.weight = weight
-        self.white_acc = np.zeros(ACCUMULATOR_DIM, dtype=np.float32)
-        self.black_acc = np.zeros(ACCUMULATOR_DIM, dtype=np.float32)
+        self.weight = weight  # int16
+        self.white_acc = np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
+        self.black_acc = np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
         self._stack: list[tuple[np.ndarray, np.ndarray]] = []
 
     def set_position(self, board: chess.Board) -> None:
@@ -133,8 +223,8 @@ class Accumulator:
     def _full(self, board: chess.Board, perspective: bool) -> np.ndarray:
         indices = halfkp_indices(board, perspective)
         if not indices:
-            return np.zeros(ACCUMULATOR_DIM, dtype=np.float32)
-        return self.weight[indices].sum(axis=0)
+            return np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
+        return self.weight[indices].sum(axis=0, dtype=_ACC_DTYPE)
 
     def accumulators_for(self, side_to_move: bool) -> np.ndarray:
         stm, nstm = (

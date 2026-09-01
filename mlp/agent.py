@@ -12,16 +12,15 @@ from pathlib import Path
 
 import chess
 import chess.polyglot
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from nnue import Accumulator, head_forward, load_weights
+from nnue import Accumulator, evaluate_head, load_weights
 
 MATE = 1e6
 MATE_SCORE = 100000
 
 _WEIGHTS = load_weights()
-_ACC = Accumulator(_WEIGHTS["feature_transformer.weight"])
+_ACC = Accumulator(_WEIGHTS.ft_weight)
 
 PIECE_VALUE = {
     chess.PAWN: 100.0,
@@ -52,8 +51,8 @@ def evaluate(board: chess.Board) -> float:
         return -MATE
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0
-    x = _ACC.accumulators_for(board.turn)[np.newaxis, :]
-    return float(head_forward(x, _WEIGHTS)[0, 0])
+    x = _ACC.accumulators_for(board.turn)
+    return evaluate_head(x, _WEIGHTS)
 
 
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
