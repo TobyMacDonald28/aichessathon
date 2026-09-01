@@ -2,8 +2,9 @@
 
 import random
 import time
-import chess
 from collections import Counter
+
+import chess
 
 PIECE_VALUE = {
     chess.PAWN: 100.0,
@@ -89,8 +90,13 @@ PASSED_PAWN_BONUS = [0, 40, 50, 50, 75, 120, 200, 0]
 
 OPENING_BOOK = {
     chess.STARTING_FEN: ["e2e4", "d2d4", "c2c4", "g1f3"],
-    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1": ["c7c5", "e7e5", "e7e6", "c7c6"], 
-    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1": ["d7d5", "g8f6", "e7e6"]
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1": [
+        "c7c5",
+        "e7e5",
+        "e7e6",
+        "c7c6",
+    ],
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1": ["d7d5", "g8f6", "e7e6"],
 }
 
 GAME_HISTORY = Counter()
@@ -135,8 +141,10 @@ def evaluate(board: chess.Board, mobility: int) -> float:
         for sq in board.pieces(piece_type, chess.BLACK):
             score -= PIECE_VALUE[piece_type] + PST_MAP[piece_type][chess.square_mirror(sq)]
 
-    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 50
-    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 50
+    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2:
+        score += 50
+    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2:
+        score -= 50
 
     if board.turn == chess.BLACK:
         score = -score
@@ -144,7 +152,9 @@ def evaluate(board: chess.Board, mobility: int) -> float:
     score += MOBILITY_WEIGHT * mobility
     return score
 
-def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float) -> float:
+def qsearch(
+    board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float
+) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
@@ -170,7 +180,15 @@ def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, ti
 
     return alpha
 
-def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_time: float, time_limit: float, path_keys: set) -> float:
+def negamax(
+    board: chess.Board,
+    depth: int,
+    alpha: float,
+    beta: float,
+    start_time: float,
+    time_limit: float,
+    path_keys: set,
+) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
@@ -272,8 +290,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 board.push(move)
                 
                 path_keys = base_path_keys.copy()
-                
-                score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit_sec, path_keys)
+
+                score = -negamax(
+                    board, depth - 1, -beta, -alpha, start_time, time_limit_sec, path_keys
+                )
                 board.pop()
 
                 if score > best_score:

@@ -4,10 +4,10 @@ incrementally-updated accumulator instead of a from-scratch forward pass. Every
 two never drift apart.
 
 Self-contained on purpose: the competition only ships one file, `agent.py`, so everything this
-needs — HalfKP feature encoding, weight loading/quantization, and the accumulator — lives here
-rather than being imported from train.py/quantize.py (those stay as the training-side tools that
-produced weights.pt in the first place). Promoting this file to the zip root is just a copy plus
-shipping weights.pt (or a quantized weights.int8.pt) alongside it.
+needs — HalfKP feature encoding, weight loading, and the accumulator — lives here rather than
+being imported from train.py/quantize.py (those stay as the training-side tools that produced
+weights.npz in the first place). Promoting this file to the zip root is just a copy plus shipping
+weights.npz alongside it.
 
 Not the competition submission yet — test with `make play --white mlp --black .` before ever
 promoting it to the zip root.
@@ -15,16 +15,16 @@ promoting it to the zip root.
 
 import time
 from collections import Counter
+from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import chess
 import chess.polyglot
 import numba
 import numpy as np
-import torch
 
-MATE = 1e6
 MATE_SCORE = 100000
 
 PIECE_VALUE = {
@@ -75,10 +75,10 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Weight loading. weights.pt straight out of train.py is a plain {key: tensor} state_dict; running
-# it through quantize.py turns it into {key: (tensor, scale)} for the two tensors worth
-# quantizing. This loader accepts either — a plain tensor gets quantized here on the spot, so the
-# runtime path below is always integer regardless of which file was shipped.
+# Weight loading. quantize.py is what produces weights.npz: it reads the float32 checkpoint
+# training writes and saves plain numpy arrays, quantizing the two tensors below on the way. Numpy
+# arrays, not a torch state_dict, so this file never needs `import torch` — nothing in the search
+# loop below touches it either, and torch is a slow, ~40MB import to pay for on every game.
 #
 # Two different reasons to quantize, for two different tensors:
 # - feature_transformer.weight is 40,961 x 256 float32, ~42MB on its own — uncomfortably close to
@@ -90,7 +90,7 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
 #   stay plain float32.
 # ---------------------------------------------------------------------------
 
-WEIGHTS_PATH = Path(__file__).parent / "weights.pt"
+WEIGHTS_PATH = Path(__file__).parent / "weights.npz"
 FEATURE_TRANSFORMER_BITS = 16  # summed over up to 32 rows; int8 rounding error compounds too much
 HEAD_BITS = 8  # one matmul, not a sum of many rows — int8 rounds cleanly, and enables SIMD
 
@@ -108,49 +108,46 @@ class NNUEWeights:
     head5_bias: np.ndarray
 
 
-StateDict = dict[str, torch.Tensor | tuple[torch.Tensor, float]]
-
-
-def _quantize_tensor(weight: torch.Tensor, bits: int) -> tuple[torch.Tensor, float]:
+def _quantize(weight: np.ndarray, bits: int) -> tuple[np.ndarray, float]:
     qmax = 2 ** (bits - 1) - 1
-    max_abs = weight.abs().max().item()
+    max_abs = float(np.abs(weight).max())
     scale = max_abs / qmax if max_abs > 0 else 1.0
-    dtype = torch.int16 if bits == 16 else torch.int8
-    quantized = torch.clamp(torch.round(weight / scale), -qmax - 1, qmax).to(dtype)
+    dtype = np.int16 if bits == 16 else np.int8
+    quantized = np.clip(np.round(weight / scale), -qmax - 1, qmax).astype(dtype)
     return quantized, scale
 
 
-def _load_integer(state: StateDict, key: str, bits: int, dtype: type) -> tuple[np.ndarray, float]:
-    value = state[key]
-    tensor, scale = value if isinstance(value, tuple) else _quantize_tensor(value, bits)
-    return tensor.numpy().astype(dtype), scale
+def _load_integer(npz: np.lib.npyio.NpzFile, key: str, bits: int) -> tuple[np.ndarray, float]:
+    weight = npz[key]
+    if np.issubdtype(weight.dtype, np.floating):
+        return _quantize(weight, bits)
+    return weight, float(npz[f"{key}.scale"])
 
 
-def _load_float(state: StateDict, key: str) -> np.ndarray:
-    value = state[key]
-    tensor, scale = value if isinstance(value, tuple) else (value, 1.0)
-    return tensor.numpy().astype(np.float32) * scale
+def _load_float(npz: np.lib.npyio.NpzFile, key: str) -> np.ndarray:
+    weight = npz[key].astype(np.float32)
+    scale_key = f"{key}.scale"
+    return weight * float(npz[scale_key]) if scale_key in npz.files else weight
 
 
 def load_weights(path: Path = WEIGHTS_PATH) -> NNUEWeights:
-    state = torch.load(path, map_location="cpu")
+    with np.load(path) as npz:
+        ft_weight, ft_scale = _load_integer(
+            npz, "feature_transformer.weight", FEATURE_TRANSFORMER_BITS
+        )
+        head1_weight, head1_scale = _load_integer(npz, "head.1.weight", HEAD_BITS)
 
-    ft_weight, ft_scale = _load_integer(
-        state, "feature_transformer.weight", FEATURE_TRANSFORMER_BITS, np.int16
-    )
-    head1_weight, head1_scale = _load_integer(state, "head.1.weight", HEAD_BITS, np.int8)
-
-    return NNUEWeights(
-        ft_weight=ft_weight,
-        ft_scale=ft_scale,
-        head1_weight=head1_weight,
-        head1_scale=head1_scale,
-        head1_bias=_load_float(state, "head.1.bias"),
-        head3_weight=_load_float(state, "head.3.weight"),
-        head3_bias=_load_float(state, "head.3.bias"),
-        head5_weight=_load_float(state, "head.5.weight"),
-        head5_bias=_load_float(state, "head.5.bias"),
-    )
+        return NNUEWeights(
+            ft_weight=ft_weight,
+            ft_scale=ft_scale,
+            head1_weight=head1_weight,
+            head1_scale=head1_scale,
+            head1_bias=_load_float(npz, "head.1.bias"),
+            head3_weight=_load_float(npz, "head.3.weight"),
+            head3_bias=_load_float(npz, "head.3.bias"),
+            head5_weight=_load_float(npz, "head.5.weight"),
+            head5_bias=_load_float(npz, "head.5.bias"),
+        )
 
 
 _WEIGHTS = load_weights()
@@ -331,13 +328,28 @@ _ACC = Accumulator(_WEIGHTS.ft_weight)
 # engine — everything else here is standard.
 # ---------------------------------------------------------------------------
 
-GAME_HISTORY = Counter()
-TT: dict = {}
+class TTEntry(TypedDict):
+    depth: int
+    score: float
+    flag: str
+    best_move: str | None
+
+
+GAME_HISTORY: Counter[Hashable] = Counter()
+TT: dict[Hashable, TTEntry] = {}
 KILLERS_PER_DEPTH = 2
 KILLERS: dict[int, list[chess.Move]] = {}
 
 SAFETY_MARGIN_MS = 50.0
 MIN_TIME_LIMIT_SEC = 0.05
+
+# Futility pruning: at a frontier node (depth 1, one ply from qsearch), a quiet move that doesn't
+# give check can't plausibly swing the score by more than a couple of pieces in one move, so if
+# the static eval already trails alpha by more than that, skip searching it instead of proving it.
+# Always searches at least the first (best-ordered) move regardless, so best_score/best_move_for_tt
+# never come out empty. Captures, promotions, and checks are exempt — those are exactly the moves
+# that can swing eval by more than the margin allows.
+FUTILITY_MARGIN = 200.0
 
 
 class SearchTimeout(Exception):
@@ -349,7 +361,7 @@ def evaluate(board: chess.Board) -> float:
     _ACC's accumulator currently holds — the caller is responsible for keeping it in sync with
     `board` via push()/pop(), not this function."""
     if board.is_checkmate():
-        return -MATE
+        return -MATE_SCORE + len(board.move_stack)
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0
     x = _ACC.accumulators_for(board.turn)
@@ -431,7 +443,7 @@ def negamax(
     beta: float,
     start_time: float,
     time_limit: float,
-    path_keys: set,
+    path_keys: set[Hashable],
 ) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
@@ -460,7 +472,9 @@ def negamax(
     if depth == 0:
         return qsearch(board, alpha, beta, start_time, time_limit)
 
-    if depth >= 3 and beta < MATE_SCORE and not board.is_check() and len(board.piece_map()) > 10:
+    in_check = board.is_check()
+
+    if depth >= 3 and beta < MATE_SCORE and not in_check and len(board.piece_map()) > 10:
         _ACC.push(board, chess.Move.null())
         null_score = -negamax(
             board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys
@@ -471,20 +485,37 @@ def negamax(
 
     legal_moves = list(board.legal_moves)
     if not legal_moves:
-        if board.is_check():
+        if in_check:
             return -MATE_SCORE + len(board.move_stack)
         return 0.0
 
     killers = KILLERS.get(depth)
     legal_moves.sort(key=lambda m: score_move(board, m, tt_move_uci, killers), reverse=True)
 
+    static_eval = evaluate(board) if depth == 1 and not in_check and beta < MATE_SCORE else None
+
     best_score = -float("inf")
     best_move_for_tt = None
     path_keys.add(key)
 
-    for move in legal_moves:
+    for move_index, move in enumerate(legal_moves):
+        is_tactical = board.is_capture(move) or move.promotion is not None
+        gives_check = board.gives_check(move)
+
+        if (
+            static_eval is not None
+            and not is_tactical
+            and not gives_check
+            and move_index > 0
+            and static_eval + FUTILITY_MARGIN <= alpha
+        ):
+            continue
+
         _ACC.push(board, move)
-        score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit, path_keys)
+        # Check extension: a move that gives check doesn't cost depth, so a forcing sequence of
+        # checks gets resolved instead of getting cut off right at the search horizon.
+        child_depth = depth if gives_check else depth - 1
+        score = -negamax(board, child_depth, -beta, -alpha, start_time, time_limit, path_keys)
         _ACC.pop(board)
 
         if score > best_score:
@@ -494,19 +525,31 @@ def negamax(
         if best_score > alpha:
             alpha = best_score
         if alpha >= beta:
-            if not board.is_capture(move) and move.promotion is None:
+            if not is_tactical:
                 store_killer(depth, move)
             break
 
     path_keys.remove(key)
 
-    flag = "EXACT"
-    if best_score <= alpha_orig:
-        flag = "UPPER"
-    elif best_score >= beta:
-        flag = "LOWER"
+    # A score of exactly 0.0 here can only come from a terminal draw (repetition, stalemate, or
+    # insufficient material) propagating up through best_score — evaluate()'s NNUE output is a
+    # continuous float that never lands on exactly 0.0. Repetition specifically is path-dependent:
+    # the same board key can be a draw via one move-order history and not a draw via a different
+    # one that reaches the identical position, so caching a repetition-tainted 0.0 as EXACT would
+    # feed a stale "it's a draw" verdict to a later search that reaches this key a different way.
+    if best_score != 0.0:
+        flag = "EXACT"
+        if best_score <= alpha_orig:
+            flag = "UPPER"
+        elif best_score >= beta:
+            flag = "LOWER"
 
-    TT[key] = {"depth": depth, "score": best_score, "flag": flag, "best_move": best_move_for_tt}
+        TT[key] = {
+            "depth": depth,
+            "score": best_score,
+            "flag": flag,
+            "best_move": best_move_for_tt,
+        }
 
     return best_score
 
@@ -551,7 +594,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             beta = float("inf")
             best_score = -float("inf")
 
-            moves.sort(key=lambda m: (board.is_capture(m), m.promotion is not None), reverse=True)
+            moves.sort(key=lambda m: score_move(board, m, best_move.uci()), reverse=True)
             current_best_move = moves[0]
 
             for move in moves:

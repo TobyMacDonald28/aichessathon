@@ -1,4 +1,4 @@
-"""Quantizes a trained weights.pt to int16 (feature transformer) / int8 (first head layer).
+"""Quantizes a trained weights.pt into the weights.npz that ships with agent.py.
 
 Two different reasons to quantize, for two different tensors:
 
@@ -16,20 +16,21 @@ round(w / scale) clamped to the integer range. Feature transformer weights get s
 32 active rows before anything reads them, so int8 rounding error would compound too far — hence
 int16 there specifically.
 
-agent.py can also quantize on the fly if handed a plain unquantized weights.pt (see its
-`load_weights`), so this script exists for shipping — it moves the quantization cost from every
-process start to a one-time offline step, and shrinks the zip.
+Output is a plain numpy .npz, not a torch file: agent.py never imports torch, so weights.npz is
+the only format it can load. torch stays here on the training side only, to read the checkpoint
+train.py wrote.
 
-Usage: python quantize.py [--in weights.pt] [--out weights.int8.pt]
+Usage: python quantize.py [--in weights.pt] [--out weights.npz]
 """
 
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 from train import WEIGHTS_PATH
 
-DEFAULT_OUTPUT = Path(__file__).parent / "weights.int8.pt"
+DEFAULT_OUTPUT = Path(__file__).parent / "weights.npz"
 
 FEATURE_TRANSFORMER_BITS = 16  # summed over up to 32 rows; int8 rounding error compounds too much
 HEAD_BITS = 8  # one matmul, not a sum of many rows — int8 rounds cleanly, and enables SIMD
@@ -40,29 +41,34 @@ QUANTIZED_KEYS = {
 }
 
 
-def quantize_tensor(weight: torch.Tensor, bits: int) -> tuple[torch.Tensor, float]:
+def quantize_tensor(weight: np.ndarray, bits: int) -> tuple[np.ndarray, float]:
     qmax = 2 ** (bits - 1) - 1
-    max_abs = weight.abs().max().item()
+    max_abs = float(np.abs(weight).max())
     scale = max_abs / qmax if max_abs > 0 else 1.0
-    dtype = torch.int16 if bits == 16 else torch.int8
-    quantized = torch.clamp(torch.round(weight / scale), -qmax - 1, qmax).to(dtype)
+    dtype = np.int16 if bits == 16 else np.int8
+    quantized = np.clip(np.round(weight / scale), -qmax - 1, qmax).astype(dtype)
     return quantized, scale
 
 
 def quantize(input_path: Path, output_path: Path) -> None:
     state = torch.load(input_path, map_location="cpu")
-    bundle: dict[str, tuple[torch.Tensor, float]] = {}
+    arrays: dict[str, np.ndarray] = {}
+    original_bytes = 0
     for key, tensor in state.items():
+        weight = tensor.numpy()
+        original_bytes += weight.nbytes
         if key in QUANTIZED_KEYS:
-            bundle[key] = quantize_tensor(tensor, QUANTIZED_KEYS[key])
+            quantized, scale = quantize_tensor(weight, QUANTIZED_KEYS[key])
+            arrays[key] = quantized
+            arrays[f"{key}.scale"] = np.float32(scale)
         else:
             # biases and the two small head layers are cheap either way; quantizing them buys
             # nothing worth the added error.
-            bundle[key] = (tensor, 1.0)
-    torch.save(bundle, output_path)
+            arrays[key] = weight.astype(np.float32)
 
-    original_bytes = sum(t.numel() * t.element_size() for t in state.values())
-    quantized_bytes = sum(t.numel() * t.element_size() for t, _ in bundle.values())
+    np.savez(output_path, **arrays)
+
+    quantized_bytes = sum(array.nbytes for array in arrays.values())
     print(
         f"{input_path} ({original_bytes / 1e6:.1f} MB) -> "
         f"{output_path} ({quantized_bytes / 1e6:.1f} MB)"

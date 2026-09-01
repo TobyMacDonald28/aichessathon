@@ -1,7 +1,7 @@
 """Event constants. Canonical source: https://aichessathon.com/docs/rules.md"""
 
 INIT_BUDGET_S = 60.0
-BASE_MS = 1_000
+BASE_MS = 120_000
 INCREMENT_MS = 500
 PLY_CAP = 300
 STDOUT_CAP = 4096
