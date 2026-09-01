@@ -21,6 +21,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import chess
@@ -37,7 +38,8 @@ WEIGHTS_PATH = Path(__file__).parent / "weights.pt"
 
 EVAL_URL = "https://database.lichess.org/lichess_db_eval.jsonl.zst"
 TARGET_CLIP_CP = 1000.0
-MIN_DEPTH = 12
+MIN_DEPTH = 16
+WDL_SCALE_CP = 400.0  # centipawns that map to a 1-sigma shift in sigmoid win-probability space
 
 # ---------------------------------------------------------------------------
 # HalfKP feature encoding: the thing that makes this NNUE rather than a plain
@@ -153,6 +155,25 @@ def _target_cp(entry: dict, stm_is_white: bool) -> float | None:
     return cp if stm_is_white else -cp
 
 
+def _is_quiet(board: chess.Board, pv: dict) -> bool:
+    """A static evaluator can't see the tactics a search would find, so positions where the side to
+    move is already in check, or the engine's own top line is a capture/promotion/check, carry a
+    target the net has no way to predict from the position alone — drop them rather than train on
+    that noise. Deliberately not stricter than this (e.g. requiring no capture anywhere on the
+    board): that would strip out most complex middlegames and bias the dataset toward bland,
+    quiet-by-construction positions."""
+    if board.is_check():
+        return False
+    line = pv.get("line")
+    if not line:
+        return True
+    try:
+        move = board.parse_uci(line.split()[0])
+    except ValueError:
+        return True
+    return not (board.is_capture(move) or move.promotion or board.gives_check(move))
+
+
 def fetch(num_positions: int, sample_every: int) -> None:
     """Streams the eval dump, keeping one position every `sample_every` lines seen, until
     `num_positions` positions have been kept. sample_every=1 takes a prefix of the file, which is
@@ -188,6 +209,9 @@ def fetch(num_positions: int, sample_every: int) -> None:
                     continue
 
                 board = chess.Board(_pad_fen(row["fen"]))
+                if not _is_quiet(board, (entry.get("pvs") or [{}])[0]):
+                    continue
+
                 target = _target_cp(entry, board.turn == chess.WHITE)
                 if target is None:
                     continue
@@ -239,7 +263,19 @@ def _resolve_device(requested: str) -> str:
     return "cpu"
 
 
-def fit(epochs: int, batch_size: int, lr: float, val_fraction: float, device: str) -> None:
+def _wdl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy between predicted and target win probability (sigmoid(cp / WDL_SCALE_CP)),
+    the standard NNUE training loss — a 900-vs-1000cp miss (both already "winning") counts for far
+    less than a 0-vs-100cp miss (drawish vs winning), and BCE's gradient stays strong even when a
+    prediction is confidently wrong, unlike MSE's which vanishes as the sigmoid saturates."""
+    return nn.functional.binary_cross_entropy_with_logits(
+        pred / WDL_SCALE_CP, torch.sigmoid(target / WDL_SCALE_CP)
+    )
+
+
+def fit(
+    epochs: int, batch_size: int, lr: float, val_fraction: float, device: str, output: str | None
+) -> None:
     count = int(np.load(COUNT_PATH)[0])
     stm_indices = np.memmap(STM_INDICES_PATH, dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE))
     nstm_indices = np.memmap(
@@ -250,7 +286,11 @@ def fit(epochs: int, batch_size: int, lr: float, val_fraction: float, device: st
     rng = np.random.default_rng(0)
     order = rng.permutation(count)
     split = int(count * (1 - val_fraction))
-    train_idx, val_idx = order[:split], order[split:]
+    # Sorted back into file order: a fully random train_idx would make every epoch's shuffle
+    # scatter reads across the whole (multi-GB, larger than free RAM on modest machines) memmap,
+    # thrashing the page cache. `batches()` below re-randomizes at block granularity instead, so
+    # sorting here costs nothing — it's what makes each block a contiguous, cache-friendly region.
+    train_idx, val_idx = np.sort(order[:split]), np.sort(order[split:])
 
     resolved_device = _resolve_device(device)
     print(f"training on {resolved_device}", file=sys.stderr)
@@ -258,12 +298,23 @@ def fit(epochs: int, batch_size: int, lr: float, val_fraction: float, device: st
     torch.manual_seed(0)
     model = NNUE().to(resolved_device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.SmoothL1Loss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     train_batches = -(-len(train_idx) // batch_size)  # ceil division
+
+    # idx is sorted into file order, so a block is a contiguous (~520MB at block_rows=2M) memmap
+    # region — small enough to stay resident in page cache even on a memory-tight machine. Only
+    # the block order (and the row order within each block) gets reshuffled per epoch; two rows
+    # from opposite ends of the file are never read back-to-back the way a fully global shuffle
+    # would, which is what was thrashing the cache.
+    block_rows = 2_000_000
 
     def batches(idx: np.ndarray, shuffle: bool):
         if shuffle:
-            rng.shuffle(idx)
+            block_starts = list(range(0, len(idx), block_rows))
+            rng.shuffle(block_starts)
+            idx = np.concatenate(
+                [rng.permutation(idx[start : start + block_rows]) for start in block_starts]
+            )
         for start in range(0, len(idx), batch_size):
             batch = np.sort(idx[start : start + batch_size])  # ascending access is memmap-friendly
             stm = torch.from_numpy(stm_indices[batch].astype(np.int64)).to(resolved_device)
@@ -273,35 +324,46 @@ def fit(epochs: int, batch_size: int, lr: float, val_fraction: float, device: st
 
     for epoch in range(epochs):
         model.train()
-        train_loss, n = 0.0, 0
+        train_loss, train_cp_err, n = 0.0, 0.0, 0
         for step, (stm, nstm, y) in enumerate(batches(train_idx, shuffle=True), start=1):
             optimizer.zero_grad()
             pred = model(stm, nstm)
-            loss = loss_fn(pred, y)
+            loss = _wdl_loss(pred, y)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(y)
+            train_cp_err += (pred - y).abs().sum().item()
             n += len(y)
             if step % 20 == 0 or step == train_batches:
-                prefix = f"epoch {epoch + 1}/{epochs} loss={train_loss / n:.2f}"
+                prefix = (
+                    f"epoch {epoch + 1}/{epochs} "
+                    f"loss={train_loss / n:.4f} cp_mae={train_cp_err / n:.1f}"
+                )
                 _progress_bar(step, train_batches, prefix)
+        scheduler.step()
 
         model.eval()
-        val_loss, vn = 0.0, 0
+        val_loss, val_cp_err, vn = 0.0, 0.0, 0
         with torch.no_grad():
             for stm, nstm, y in batches(val_idx, shuffle=False):
                 pred = model(stm, nstm)
-                val_loss += loss_fn(pred, y).item() * len(y)
+                val_loss += _wdl_loss(pred, y).item() * len(y)
+                val_cp_err += (pred - y).abs().sum().item()
                 vn += len(y)
 
         print(
             f"epoch {epoch + 1}/{epochs} "
-            f"train_loss={train_loss / n:.2f} val_loss={val_loss / vn:.2f}",
+            f"train_loss={train_loss / n:.4f} train_cp_mae={train_cp_err / n:.1f} "
+            f"val_loss={val_loss / vn:.4f} val_cp_mae={val_cp_err / vn:.1f} "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}",
             file=sys.stderr,
         )
 
-    torch.save({k: v.cpu() for k, v in model.state_dict().items()}, WEIGHTS_PATH)
-    print(f"saved {WEIGHTS_PATH}", file=sys.stderr)
+    if output is None:
+        output = f"weights_{epochs}ep_{batch_size}bs_{time.strftime('%Y%m%d-%H%M%S')}.pt"
+    output_path = WEIGHTS_PATH.parent / output
+    torch.save({k: v.cpu() for k, v in model.state_dict().items()}, output_path)
+    print(f"saved {output_path}", file=sys.stderr)
 
 
 def main() -> None:
@@ -320,6 +382,12 @@ def main() -> None:
     fit_parser.add_argument("--lr", type=float, default=1e-3)
     fit_parser.add_argument("--val-fraction", type=float, default=0.02)
     fit_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    fit_parser.add_argument(
+        "--output",
+        default=None,
+        help="weights filename under mlp/ (default: auto-named from epochs/batch-size/timestamp "
+        "so runs don't clobber each other; pass 'weights.pt' explicitly to promote a run)",
+    )
 
     arguments = parser.parse_args()
     if arguments.command == "fetch":
@@ -331,6 +399,7 @@ def main() -> None:
             arguments.lr,
             arguments.val_fraction,
             arguments.device,
+            arguments.output,
         )
 
 

@@ -6,8 +6,8 @@ Two different reasons to quantize, for two different tensors:
   zip's 50MB cap on its own. int16 halves that, leaving real headroom for the rest of the zip.
   This one is about file size.
 - `head.1.weight` (512 x 32) is a few KB either way, so quantizing it buys nothing on disk. It's
-  quantized so nnue.py can run it as a genuine int8 SIMD dot product at inference time instead of
-  a float32 matmul — see nnue.py's `_int8_matvec` and `evaluate_head`. It's also the only head
+  quantized so agent.py can run it as a genuine int8 SIMD dot product at inference time instead of
+  a float32 matmul — see agent.py's `_int8_matvec` and `evaluate_head`. It's also the only head
   layer worth bothering with: at 512x32 multiply-adds it does ~94% of the head's arithmetic,
   versus 32x32 and 32x1 for the two layers after it, so those stay plain float32.
 
@@ -16,7 +16,7 @@ round(w / scale) clamped to the integer range. Feature transformer weights get s
 32 active rows before anything reads them, so int8 rounding error would compound too far — hence
 int16 there specifically.
 
-`nnue.py` can also quantize on the fly if handed a plain unquantized weights.pt (see
+agent.py can also quantize on the fly if handed a plain unquantized weights.pt (see its
 `load_weights`), so this script exists for shipping — it moves the quantization cost from every
 process start to a one-time offline step, and shrinks the zip.
 

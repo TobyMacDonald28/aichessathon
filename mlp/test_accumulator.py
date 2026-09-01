@@ -15,8 +15,9 @@ import chess
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from nnue import Accumulator
-from train import ACCUMULATOR_DIM, FEATURE_DIM
+from train import FEATURE_DIM
+
+from agent import ACCUMULATOR_DIM, Accumulator
 
 # Positions chosen to force specific move types soon after the game starts: castling (both
 # sides), en passant, promotion, and a capture, rather than hoping random play stumbles into them.
