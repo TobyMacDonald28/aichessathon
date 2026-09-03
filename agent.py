@@ -510,7 +510,19 @@ def negamax(
         # Check extension: a move that gives check doesn't cost depth, so a forcing sequence of
         # checks gets resolved instead of getting cut off right at the search horizon.
         child_depth = depth if gives_check else depth - 1
-        score = -negamax(board, child_depth, -beta, -alpha, start_time, time_limit, path_keys)
+        # Principal variation search: trust the move ordering and search everything after the
+        # first move with a null window, which is cheaper to prove a fail-low/fail-high on. Only
+        # pay for a full-window re-search when the null window actually fails to refute the move.
+        if move_index == 0:
+            score = -negamax(board, child_depth, -beta, -alpha, start_time, time_limit, path_keys)
+        else:
+            score = -negamax(
+                board, child_depth, -alpha - 1, -alpha, start_time, time_limit, path_keys
+            )
+            if alpha < score < beta:
+                score = -negamax(
+                    board, child_depth, -beta, -alpha, start_time, time_limit, path_keys
+                )
         _ACC.pop(board)
 
         if score > best_score:

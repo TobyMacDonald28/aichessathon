@@ -1,0 +1,6 @@
+# Documentation only — the platform ignores this file and always uses its own fixed,
+# preinstalled stack (torch 2.13 CPU, numpy 2.5, python-chess 1.11, onnxruntime 1.29, numba 0.67)
+# regardless of what's shipped in the zip. This just lists what agent.py itself actually imports.
+chess==1.11.2
+numpy==2.5.2
+numba==0.67.0
