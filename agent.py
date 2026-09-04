@@ -363,6 +363,12 @@ FUTILITY_MARGIN = 200.0
 
 ASPIRATION_WINDOW = 50.0
 
+# How much costlier the next depth is assumed to be, for the predictive skip below. Deliberately
+# set near the low end of observed real per-depth cost growth (measured 1.16x-10.6x across several
+# positions) rather than a "typical" value like 3x — see the skip's own comment for why this
+# direction of bias is the safe one.
+SAFE_SKIP_GROWTH = 1.5
+
 # Panic extension: a root score that craters between depths means the move that looked fine a ply
 # shallower might actually blunder, so it's worth stealing time from later moves to resolve that
 # now instead of getting cut off mid-crisis. (Tried also triggering this on the best move simply
@@ -437,12 +443,26 @@ def contempt_score(board: chess.Board) -> float:
     return -CONTEMPT if balance > 0 else CONTEMPT if balance < 0 else 0.0
 
 
+OPENING_TAPER_MOVES = 20  # moves over which the opening boost below fades out
+OPENING_START_BUDGET_SEC = 6.0  # target budget at move 1, before any taper
+
+
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
     # Assume the game wraps up by move 55, floored at 15 moves left so a long game never assumes
     # too few moves remain and overspends the clock.
     expected_moves_left = max(15, 55 - board.fullmove_number)
     usable_ms = max(time_left_ms - SAFETY_MARGIN_MS, 0.0)
     budget_sec = max(usable_ms / 1000.0 / expected_moves_left, MIN_TIME_LIMIT_SEC)
+    # Early moves get an even division of a (deliberately overestimated) 55-move game, which comes
+    # out well under what's worth spending on a full clock — fine for book-covered theory, too thin
+    # once book runs out and the position still needs real evaluation. Blended toward a bigger
+    # opening target rather than floored outright: the blend weight fades linearly to exactly 0 by
+    # OPENING_TAPER_MOVES, so the boost tapers off smoothly into the ordinary formula instead of
+    # stepping down the moment the opening "ends" — there's no move where the budget cliffs.
+    taper = max(0.0, 1.0 - (board.fullmove_number - 1) / OPENING_TAPER_MOVES)
+    if taper > 0.0:
+        blended = OPENING_START_BUDGET_SEC * taper + budget_sec * (1.0 - taper)
+        budget_sec = max(budget_sec, blended)
     # Capped well under half the clock: the per-move share above already self-corrects as the
     # clock drains, this cap only matters when it doesn't (a short game, a big expected-moves
     # underestimate) — and a quarter of what's left survives many more consecutive bad guesses
@@ -814,6 +834,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     best_move = moves[0]
     prev_score: float | None = None
+    last_depth_time = 0.0
 
     try:
         # 100, not some smaller nominal cap: a forcing position (checks, narrow threats — often
@@ -824,17 +845,23 @@ def get_move(fen: str, time_left_ms: int) -> str:
         # supposed to decide when to stop. 100 plies is not a realistic search depth for this
         # engine's speed at any real per-move budget, so in practice this never binds; it's a
         # safety ceiling against a runaway loop, not a working limit.
-        #
-        # No predictive "will the next depth even fit?" skip here on purpose (there used to be
-        # one, based on a fixed multiple of the last depth's cost) — measured per-depth cost growth
-        # across a handful of real positions ranged from 1.16x to 10.6x, too wide for any fixed
-        # multiplier to represent, and the two failure directions aren't symmetric: attempting a
-        # depth that gets cut off by SearchTimeout costs at most one node's worth of overrun (the
-        # timeout check runs at the top of every node) and simply falls back to the last completed
-        # depth's move, while skipping a depth that would have finished wastes real budget for
-        # nothing in return. Always attempting the next depth and letting SearchTimeout bound the
-        # worst case dominates guessing wrong in the expensive direction.
         for depth in range(1, 100):
+            elapsed_before_depth = time.time() - start_time
+            # Predictive skip, deliberately biased toward attempting: don't even start the next
+            # depth only when a conservative (low) estimate of its cost already blows the budget.
+            # Measured real per-depth cost growth across several positions ranged from 1.16x to
+            # 10.6x — a "typical" 3x estimate skipped depths that would've finished 57-62% of the
+            # time in testing, because real growth is often far below that. SAFE_SKIP_GROWTH sits
+            # near the observed low end instead: since true cost is almost always higher than this
+            # estimate, failing to fit even this optimistic projection means the real depth has no
+            # realistic chance either — so a skip here is a high-confidence one, not a guess. Any
+            # depth that clears this check but still runs long gets bounded by SearchTimeout
+            # anyway (checked at the top of every node), which costs at most one node's overrun.
+            if depth > 2 and elapsed_before_depth + last_depth_time * SAFE_SKIP_GROWTH > (
+                time_limit_sec
+            ):
+                break
+
             moves.sort(key=lambda m: score_move(board, m, best_move.uci()), reverse=True)
 
             # Aspiration windows: depth d-1's score is almost always close to depth d's, so start
@@ -863,6 +890,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
             best_move = current_best_move
             prev_score = best_score
+            last_depth_time = (time.time() - start_time) - elapsed_before_depth
 
     except SearchTimeout:
         pass
