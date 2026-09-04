@@ -1,10 +1,9 @@
 """The submission entrypoint. The platform imports this file and calls get_move."""
 
-import random
-import sys
 import time
-import chess
 from collections import Counter
+
+import chess
 import chess.polyglot
 
 PIECE_VALUE = {
@@ -215,8 +214,10 @@ def evaluate(board: chess.Board, mobility: int) -> float:
     eg_phase = MAX_PHASE - mg_phase
     score += (mg_score * mg_phase + eg_score * eg_phase) / MAX_PHASE
 
-    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 50
-    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 50
+    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2:
+        score += 50
+    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2:
+        score -= 50
 
     if board.turn == chess.BLACK:
         score = -score
@@ -250,7 +251,9 @@ def score_move(
 
     return score
 
-def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float) -> float:
+def qsearch(
+    board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float
+) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
@@ -276,7 +279,15 @@ def qsearch(board: chess.Board, alpha: float, beta: float, start_time: float, ti
 
     return alpha
 
-def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_time: float, time_limit: float, path_keys: set) -> float:
+def negamax(
+    board: chess.Board,
+    depth: int,
+    alpha: float,
+    beta: float,
+    start_time: float,
+    time_limit: float,
+    path_keys: set,
+) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
@@ -312,7 +323,9 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float, start_tim
     if depth >= 3 and beta < MATE_SCORE and not board.is_check() and len(board.piece_map()) > 10:
         board.push(chess.Move.null())
         # Search with reduced depth (R=2) and a zero-window
-        null_score = -negamax(board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys)
+        null_score = -negamax(
+            board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys
+        )
         board.pop()
         
         if null_score >= beta:
@@ -406,8 +419,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 board.push(move)
                 
                 path_keys = base_path_keys.copy()
-                
-                score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit_sec, path_keys)
+
+                score = -negamax(
+                    board, depth - 1, -beta, -alpha, start_time, time_limit_sec, path_keys
+                )
                 board.pop()
 
                 if score > best_score:

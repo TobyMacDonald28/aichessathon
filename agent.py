@@ -1,30 +1,25 @@
-"""NNUE agent variant: same search shell as the root agent.py, but evaluate() is backed by an
-incrementally-updated accumulator instead of a from-scratch forward pass. Every
-`board.push`/`board.pop` in the search below goes through `acc.push`/`acc.pop` instead, so the
-two never drift apart.
+"""NNUE agent: evaluate() is backed by an incrementally-updated accumulator instead of a
+from-scratch forward pass. Every `board.push`/`board.pop` in the search below goes through
+`acc.push`/`acc.pop` instead, so the two never drift apart.
 
 Self-contained on purpose: the competition only ships one file, `agent.py`, so everything this
-needs — HalfKP feature encoding, weight loading/quantization, and the accumulator — lives here
-rather than being imported from train.py/quantize.py (those stay as the training-side tools that
-produced weights.pt in the first place). Promoting this file to the zip root is just a copy plus
-shipping weights.pt (or a quantized weights.int8.pt) alongside it.
-
-Not the competition submission yet — test with `make play --white mlp --black .` before ever
-promoting it to the zip root.
+needs — HalfKP feature encoding, weight loading, and the accumulator — lives here rather than
+being imported from mlp/train.py or mlp/quantize.py (those stay as the training-side tools that
+produced weights.npz in the first place).
 """
 
 import time
 from collections import Counter
+from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import chess
 import chess.polyglot
 import numba
 import numpy as np
-import torch
 
-MATE = 1e6
 MATE_SCORE = 100000
 
 PIECE_VALUE = {
@@ -75,10 +70,10 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Weight loading. weights.pt straight out of train.py is a plain {key: tensor} state_dict; running
-# it through quantize.py turns it into {key: (tensor, scale)} for the two tensors worth
-# quantizing. This loader accepts either — a plain tensor gets quantized here on the spot, so the
-# runtime path below is always integer regardless of which file was shipped.
+# Weight loading. mlp/quantize.py is what produces weights.npz: it reads the float32 checkpoint
+# training writes and saves plain numpy arrays, quantizing the two tensors below on the way. Numpy
+# arrays, not a torch state_dict, so this file never needs `import torch` — nothing in the search
+# loop below touches it either, and torch is a slow, ~40MB import to pay for on every game.
 #
 # Two different reasons to quantize, for two different tensors:
 # - feature_transformer.weight is 40,961 x 256 float32, ~42MB on its own — uncomfortably close to
@@ -90,7 +85,8 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
 #   stay plain float32.
 # ---------------------------------------------------------------------------
 
-WEIGHTS_PATH = Path(__file__).parent / "weights.pt"
+WEIGHTS_PATH = Path(__file__).parent / "weights.npz"
+BOOK_PATH = Path(__file__).parent / "book.bin"
 FEATURE_TRANSFORMER_BITS = 16  # summed over up to 32 rows; int8 rounding error compounds too much
 HEAD_BITS = 8  # one matmul, not a sum of many rows — int8 rounds cleanly, and enables SIMD
 
@@ -108,49 +104,46 @@ class NNUEWeights:
     head5_bias: np.ndarray
 
 
-StateDict = dict[str, torch.Tensor | tuple[torch.Tensor, float]]
-
-
-def _quantize_tensor(weight: torch.Tensor, bits: int) -> tuple[torch.Tensor, float]:
+def _quantize(weight: np.ndarray, bits: int) -> tuple[np.ndarray, float]:
     qmax = 2 ** (bits - 1) - 1
-    max_abs = weight.abs().max().item()
+    max_abs = float(np.abs(weight).max())
     scale = max_abs / qmax if max_abs > 0 else 1.0
-    dtype = torch.int16 if bits == 16 else torch.int8
-    quantized = torch.clamp(torch.round(weight / scale), -qmax - 1, qmax).to(dtype)
+    dtype = np.int16 if bits == 16 else np.int8
+    quantized = np.clip(np.round(weight / scale), -qmax - 1, qmax).astype(dtype)
     return quantized, scale
 
 
-def _load_integer(state: StateDict, key: str, bits: int, dtype: type) -> tuple[np.ndarray, float]:
-    value = state[key]
-    tensor, scale = value if isinstance(value, tuple) else _quantize_tensor(value, bits)
-    return tensor.numpy().astype(dtype), scale
+def _load_integer(npz: np.lib.npyio.NpzFile, key: str, bits: int) -> tuple[np.ndarray, float]:
+    weight = npz[key]
+    if np.issubdtype(weight.dtype, np.floating):
+        return _quantize(weight, bits)
+    return weight, float(npz[f"{key}.scale"])
 
 
-def _load_float(state: StateDict, key: str) -> np.ndarray:
-    value = state[key]
-    tensor, scale = value if isinstance(value, tuple) else (value, 1.0)
-    return tensor.numpy().astype(np.float32) * scale
+def _load_float(npz: np.lib.npyio.NpzFile, key: str) -> np.ndarray:
+    weight = npz[key].astype(np.float32)
+    scale_key = f"{key}.scale"
+    return weight * float(npz[scale_key]) if scale_key in npz.files else weight
 
 
 def load_weights(path: Path = WEIGHTS_PATH) -> NNUEWeights:
-    state = torch.load(path, map_location="cpu")
+    with np.load(path) as npz:
+        ft_weight, ft_scale = _load_integer(
+            npz, "feature_transformer.weight", FEATURE_TRANSFORMER_BITS
+        )
+        head1_weight, head1_scale = _load_integer(npz, "head.1.weight", HEAD_BITS)
 
-    ft_weight, ft_scale = _load_integer(
-        state, "feature_transformer.weight", FEATURE_TRANSFORMER_BITS, np.int16
-    )
-    head1_weight, head1_scale = _load_integer(state, "head.1.weight", HEAD_BITS, np.int8)
-
-    return NNUEWeights(
-        ft_weight=ft_weight,
-        ft_scale=ft_scale,
-        head1_weight=head1_weight,
-        head1_scale=head1_scale,
-        head1_bias=_load_float(state, "head.1.bias"),
-        head3_weight=_load_float(state, "head.3.weight"),
-        head3_bias=_load_float(state, "head.3.bias"),
-        head5_weight=_load_float(state, "head.5.weight"),
-        head5_bias=_load_float(state, "head.5.bias"),
-    )
+        return NNUEWeights(
+            ft_weight=ft_weight,
+            ft_scale=ft_scale,
+            head1_weight=head1_weight,
+            head1_scale=head1_scale,
+            head1_bias=_load_float(npz, "head.1.bias"),
+            head3_weight=_load_float(npz, "head.3.weight"),
+            head3_bias=_load_float(npz, "head.3.bias"),
+            head5_weight=_load_float(npz, "head.5.weight"),
+            head5_bias=_load_float(npz, "head.5.bias"),
+        )
 
 
 _WEIGHTS = load_weights()
@@ -326,22 +319,94 @@ class Accumulator:
 _ACC = Accumulator(_WEIGHTS.ft_weight)
 
 # ---------------------------------------------------------------------------
-# Search: alpha-beta negamax with a transposition table, quiescence search on captures, null-move
-# pruning, and killer-move ordering. evaluate() is the only thing that differs from a classical
-# engine — everything else here is standard.
+# Search: alpha-beta negamax with PVS, aspiration windows, a fixed-size TT, null-move pruning,
+# futility pruning, LMR, check extensions, and killer ordering; quiescence search on captures
+# pruned by SEE. evaluate() is the only non-classical piece — everything else here is standard.
 # ---------------------------------------------------------------------------
 
-GAME_HISTORY = Counter()
-TT: dict = {}
+class TTSlot(NamedTuple):
+    sig: int  # full hash of the position key, to detect a different position sharing this slot
+    depth: int
+    score: float
+    flag: str
+    best_move: str | None
+
+
+# A plain dict here would grow to over a million entries over a long game, and periodically
+# resetting it (the old `TT = {}` once it got too big) triggers a Python GC pass over every one of
+# those entries at once — a multi-hundred-millisecond stall stolen from the clock, right as it
+# throws away everything the engine just spent time computing. A fixed-size table sidesteps both:
+# it never grows past its preallocated slots, so there is nothing to periodically free, and it
+# never needs clearing between games either — a stale slot from a different position just fails
+# the signature check below and is treated as a miss.
+TT_SIZE = 1_000_000
+GAME_HISTORY: Counter[Hashable] = Counter()
+TT: list[TTSlot | None] = [None] * TT_SIZE
 KILLERS_PER_DEPTH = 2
 KILLERS: dict[int, list[chess.Move]] = {}
 
-SAFETY_MARGIN_MS = 50.0
+# Flag fall is an instant loss, so this errs generous: a wider margin costs a little search depth
+# on the clock, an overshoot costs the whole game. 50ms was sized for an unloaded, dedicated core;
+# it doesn't survive real scheduling jitter (a contended core, a GC pause, a slow node deep in a
+# capture-heavy Q-search position) — reproducing a flag loss from testing showed no single search
+# call anywhere near its own budget, so the shortfall was time lost between calls, not inside one.
+SAFETY_MARGIN_MS = 300.0
 MIN_TIME_LIMIT_SEC = 0.05
+
+# Futility pruning: at a frontier node (depth 1, one ply from qsearch), a quiet move that doesn't
+# give check can't plausibly swing the score by more than a couple of pieces in one move, so if
+# the static eval already trails alpha by more than that, skip searching it instead of proving it.
+# Always searches at least the first (best-ordered) move regardless, so best_score/best_move_for_tt
+# never come out empty. Captures, promotions, and checks are exempt — those are exactly the moves
+# that can swing eval by more than the margin allows.
+FUTILITY_MARGIN = 200.0
+
+ASPIRATION_WINDOW = 50.0
+
+# How much costlier the next depth is assumed to be than the one just finished, for deciding
+# whether to even attempt it. Real ratios vary a lot in practice (TT hits and aspiration windows
+# can make a depth much cheaper than a raw branching-factor estimate suggests), so this errs on
+# the low side deliberately: better to occasionally skip a depth that would have finished than to
+# routinely start one that can't, burns most of the remaining budget getting cut off mid-search,
+# and produces a move no better than the one already in hand.
+DEPTH_COST_MULTIPLIER = 3.0
+
+# Panic extension: a root score that craters between depths means the move that looked fine a ply
+# shallower might actually blunder, so it's worth stealing time from later moves to resolve that
+# now instead of getting cut off mid-crisis. Capped on two axes so a panic can never become a
+# time-safety risk: at most PANIC_MAX_MULTIPLE times the move's original budget, and never more
+# than half of whatever is actually left on the clock, whichever is smaller — the second cap is
+# what matters late in a game, when even a full multiple of the (by-then small) per-move budget
+# would otherwise still be safe in isolation but risky repeated over several panicky moves in a
+# row.
+PANIC_SCORE_DROP = 100.0
+PANIC_MULTIPLIER = 2.0
+PANIC_MAX_MULTIPLE = 3.0
+
+# Contempt: a repetition or fifty-move draw scores as a small loss for whoever's ahead on
+# material and a small gain for whoever's behind, instead of a flat 0. Search depth can't always
+# tell a genuine dead end apart from a slow-burning winning plan — both look equally flat within
+# the horizon — so this doesn't teach the engine to find the win, it just stops a provable draw
+# from looking as good as everything else when there's a material edge to protect.
+CONTEMPT = 30.0
+
+# The king can be a recapturing attacker in see()'s exchange even though it's never a capture
+# victim — overvalued here so it's always the last piece tried.
+SEE_PIECE_VALUE = {**PIECE_VALUE, chess.KING: 20000.0}
 
 
 class SearchTimeout(Exception):
     pass
+
+
+def tt_slot_index(key: Hashable) -> tuple[int, int]:
+    """Map a position key to (slot index, verification signature). `hash()` on the key's own
+    tuple of piece bitboards is already a well-distributed 64-bit-ish value — masked positive and
+    reduced mod TT_SIZE for the slot, kept in full as the signature stored in that slot so a
+    different position landing on the same index is detected instead of silently mistaken for a
+    hit."""
+    sig = hash(key) & 0xFFFFFFFFFFFFFFFF
+    return sig % TT_SIZE, sig
 
 
 def evaluate(board: chess.Board) -> float:
@@ -349,18 +414,42 @@ def evaluate(board: chess.Board) -> float:
     _ACC's accumulator currently holds — the caller is responsible for keeping it in sync with
     `board` via push()/pop(), not this function."""
     if board.is_checkmate():
-        return -MATE
+        return -MATE_SCORE + len(board.move_stack)
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0
     x = _ACC.accumulators_for(board.turn)
     return evaluate_head(x, _WEIGHTS)
 
 
+def material_balance(board: chess.Board, perspective: bool) -> float:
+    """Raw material count for `perspective` minus the opponent's, in PIECE_VALUE units. Used only
+    for contempt — deliberately simpler and cheaper than evaluate(), since it just needs to know
+    who's ahead, not by how much or why."""
+    opponent = not perspective
+    return sum(
+        value * (len(board.pieces(pt, perspective)) - len(board.pieces(pt, opponent)))
+        for pt, value in PIECE_VALUE.items()
+    )
+
+
+def contempt_score(board: chess.Board) -> float:
+    """Score a drawn position (repetition or the fifty-move rule) relative to the side to move:
+    a small loss if they're materially ahead, a small gain if they're behind, flat if level."""
+    balance = material_balance(board, board.turn)
+    return -CONTEMPT if balance > 0 else CONTEMPT if balance < 0 else 0.0
+
+
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
-    expected_moves_left = max(20, 60 - board.fullmove_number)
+    # Assume the game wraps up by move 55, floored at 15 moves left so a long game never assumes
+    # too few moves remain and overspends the clock.
+    expected_moves_left = max(15, 55 - board.fullmove_number)
     usable_ms = max(time_left_ms - SAFETY_MARGIN_MS, 0.0)
     budget_sec = max(usable_ms / 1000.0 / expected_moves_left, MIN_TIME_LIMIT_SEC)
-    return min(budget_sec, time_left_ms / 1000.0 * 0.5)
+    # Capped well under half the clock: the per-move share above already self-corrects as the
+    # clock drains, this cap only matters when it doesn't (a short game, a big expected-moves
+    # underestimate) — and a quarter of what's left survives many more consecutive bad guesses
+    # before the clock is in danger than a half would.
+    return min(budget_sec, time_left_ms / 1000.0 * 0.25)
 
 
 def store_killer(depth: int, move: chess.Move) -> None:
@@ -377,6 +466,8 @@ def score_move(
     tt_move_uci: str | None = None,
     killers: list[chess.Move] | None = None,
 ) -> float:
+    # Tiers widely spaced so nothing in one can outscore the next: TT move, promotions, captures,
+    # killers, then everything else falls through to 0.
     if tt_move_uci and move.uci() == tt_move_uci:
         return 1000000.0
 
@@ -396,22 +487,96 @@ def score_move(
     return score
 
 
+def see(board: chess.Board, move: chess.Move) -> float:
+    """Static exchange evaluation: play out every recapture on move.to_square, both sides always
+    answering with their least valuable attacker, and return the net material result for the side
+    making `move`. Unlike MVV-LVA (a one-ply guess), this accounts for the whole exchange — Pawn
+    takes Queen defended by a Pawn scores as a loss, not a win. Works on a scratch copy of the
+    board via piece placement rather than push/pop, since move-legality (check detection, etc.)
+    is irrelevant to who wins an exchange and would only slow this down."""
+    to_square = move.to_square
+    attacker = board.piece_at(move.from_square)
+    assert attacker is not None
+
+    scratch = board.copy(stack=False)
+    if scratch.is_en_passant(move):
+        captured_value = SEE_PIECE_VALUE[chess.PAWN]
+        scratch.remove_piece_at(to_square + (-8 if attacker.color == chess.WHITE else 8))
+    else:
+        captured = scratch.piece_at(to_square)
+        captured_value = SEE_PIECE_VALUE.get(captured.piece_type, 0.0) if captured else 0.0
+
+    scratch.remove_piece_at(move.from_square)
+    scratch.set_piece_at(to_square, attacker)
+
+    # The classic "swap" algorithm: build up the list of material swings as each side in turn
+    # recaptures with its cheapest attacker, then fold the list back to front so each side is
+    # credited with stopping the exchange the moment continuing it would lose them material.
+    gains = [captured_value]
+    occupant_value = SEE_PIECE_VALUE.get(attacker.piece_type, 0.0)
+    side = not attacker.color
+
+    while True:
+        attackers = scratch.attackers(side, to_square)
+        if not attackers:
+            break
+        least_square = min(attackers, key=lambda sq: _piece_see_value(scratch, sq))
+        least_piece = scratch.piece_at(least_square)
+        assert least_piece is not None
+        gains.append(occupant_value - gains[-1])
+        occupant_value = SEE_PIECE_VALUE.get(least_piece.piece_type, 0.0)
+        scratch.remove_piece_at(least_square)
+        scratch.set_piece_at(to_square, least_piece)
+        side = not side
+
+    for i in range(len(gains) - 2, -1, -1):
+        gains[i] = -max(-gains[i], gains[i + 1])
+    return gains[0]
+
+
+def _piece_see_value(board: chess.Board, square: int) -> float:
+    piece = board.piece_at(square)
+    assert piece is not None
+    return SEE_PIECE_VALUE.get(piece.piece_type, 0.0)
+
+
 def qsearch(
     board: chess.Board, alpha: float, beta: float, start_time: float, time_limit: float
 ) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
-    stand_pat = evaluate(board)
-    if stand_pat >= beta:
-        return beta
-    if alpha < stand_pat:
-        alpha = stand_pat
+    in_check = board.is_check()
 
-    captures = list(board.generate_legal_captures())
-    captures.sort(key=lambda m: score_move(board, m), reverse=True)
+    # Standing pat means "the position is at least this good even if I do nothing" — not a
+    # legal option while in check, since doing nothing isn't legal there. Skipping it also means
+    # generate_legal_captures() would silently miss the position entirely if it has no captures at
+    # all (a checkmate, or an escape that isn't a capture), so those get handled explicitly below.
+    if not in_check:
+        stand_pat = evaluate(board)
+        if stand_pat >= beta:
+            return beta
+        if alpha < stand_pat:
+            alpha = stand_pat
 
-    for move in captures:
+    # generate_legal_captures() filters the *legal* move list down to captures — while in check,
+    # that legal list is already just evasions, so this silently drops any evasion that isn't a
+    # capture (a king step, a block). Search the full evasion list instead so those aren't missed.
+    moves = list(board.legal_moves) if in_check else list(board.generate_legal_captures())
+    if in_check and not moves:
+        return -MATE_SCORE + len(board.move_stack)
+
+    # Sorted by SEE value, best exchange first, so the loop below can stop the instant it reaches
+    # a losing capture instead of exploring it — that's most of the point, this is where a
+    # Q-search spends the bulk of its time otherwise. Not a real exchange value for a quiet
+    # evasion, but see() degrades to 0.0 for those (no piece captured, nothing to swap), which
+    # keeps them ahead of genuinely losing captures without pruning them.
+    scored = sorted(((see(board, m), m) for m in moves), key=lambda p: p[0], reverse=True)
+
+    for see_value, move in scored:
+        if see_value < 0 and not in_check:
+            break
+
         _ACC.push(board, move)
         score = -qsearch(board, -beta, -alpha, start_time, time_limit)
         _ACC.pop(board)
@@ -431,36 +596,45 @@ def negamax(
     beta: float,
     start_time: float,
     time_limit: float,
-    path_keys: set,
+    path_keys: set[Hashable],
 ) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
     key = board._transposition_key()
 
-    if GAME_HISTORY[key] >= 2 or key in path_keys:
-        return 0.0
+    # is_fifty_moves() is halfmove_clock >= 100 with a built-in check that no other means of
+    # ending the game (checkmate, stalemate) takes precedence — exactly the guard this needs,
+    # since a quiet 100th half-move can just as easily be mate as a non-event.
+    if GAME_HISTORY[key] >= 2 or key in path_keys or board.is_fifty_moves():
+        return contempt_score(board)
 
     alpha_orig = alpha
     tt_move_uci = None
+    tt_index, tt_sig = tt_slot_index(key)
+    tt_slot = TT[tt_index]
 
-    if key in TT:
-        tt_entry = TT[key]
-        tt_move_uci = tt_entry.get("best_move")
-        if tt_entry["depth"] >= depth:
-            if tt_entry["flag"] == "EXACT":
-                return tt_entry["score"]
-            elif tt_entry["flag"] == "LOWER":
-                alpha = max(alpha, tt_entry["score"])
-            elif tt_entry["flag"] == "UPPER":
-                beta = min(beta, tt_entry["score"])
+    if tt_slot is not None and tt_slot.sig == tt_sig:
+        tt_move_uci = tt_slot.best_move
+        if tt_slot.depth >= depth:
+            if tt_slot.flag == "EXACT":
+                return tt_slot.score
+            elif tt_slot.flag == "LOWER":
+                alpha = max(alpha, tt_slot.score)
+            elif tt_slot.flag == "UPPER":
+                beta = min(beta, tt_slot.score)
             if alpha >= beta:
-                return tt_entry["score"]
+                return tt_slot.score
 
     if depth == 0:
         return qsearch(board, alpha, beta, start_time, time_limit)
 
-    if depth >= 3 and beta < MATE_SCORE and not board.is_check() and len(board.piece_map()) > 10:
+    in_check = board.is_check()
+
+    # Null-move pruning: if passing the move entirely still beats beta after a shallow look, a
+    # real move can only be better, so skip this node. Skipped in check (passing isn't legal) and
+    # under 10 pieces (zugzwang endgames, where passing can be the only good move).
+    if depth >= 3 and beta < MATE_SCORE and not in_check and chess.popcount(board.occupied) > 10:
         _ACC.push(board, chess.Move.null())
         null_score = -negamax(
             board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys
@@ -471,20 +645,74 @@ def negamax(
 
     legal_moves = list(board.legal_moves)
     if not legal_moves:
-        if board.is_check():
+        if in_check:
             return -MATE_SCORE + len(board.move_stack)
         return 0.0
 
     killers = KILLERS.get(depth)
     legal_moves.sort(key=lambda m: score_move(board, m, tt_move_uci, killers), reverse=True)
 
+    static_eval = evaluate(board) if depth == 1 and not in_check and beta < MATE_SCORE else None
+
     best_score = -float("inf")
     best_move_for_tt = None
     path_keys.add(key)
 
-    for move in legal_moves:
+    for move_index, move in enumerate(legal_moves):
+        is_tactical = board.is_capture(move) or move.promotion is not None
+        gives_check = board.gives_check(move)
+
+        if (
+            static_eval is not None
+            and not is_tactical
+            and not gives_check
+            and move_index > 0
+            and static_eval + FUTILITY_MARGIN <= alpha
+        ):
+            continue
+
         _ACC.push(board, move)
-        score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit, path_keys)
+        # Check extension: a move that gives check doesn't cost depth, so a forcing sequence of
+        # checks gets resolved instead of getting cut off right at the search horizon.
+        child_depth = depth if gives_check else depth - 1
+
+        # Late move reductions: move ordering has already put the promising moves first, so a
+        # quiet, non-checking move this far down the list is unlikely to be the best one — search
+        # it shallow first, on the same null window PVS would use anyway, and only pay for a full
+        # child_depth search if that shallow look says the move is worth a second look.
+        search_depth = child_depth
+        # Thresholds tuned by feel: leave the first few moves and the two plies above qsearch
+        # untouched, reduce harder for moves both late and deep.
+        if (
+            move_index > 3
+            and not is_tactical
+            and not gives_check
+            and not in_check
+            and depth >= 3
+        ):
+            reduction = 2 if move_index > 10 and depth >= 4 else 1
+            search_depth = max(child_depth - reduction, 0)
+
+        # Principal variation search: trust the move ordering and search everything after the
+        # first move with a null window, which is cheaper to prove a fail-low/fail-high on. Only
+        # pay for a full-window re-search when the null window actually fails to refute the move.
+        if move_index == 0:
+            score = -negamax(board, child_depth, -beta, -alpha, start_time, time_limit, path_keys)
+        else:
+            score = -negamax(
+                board, search_depth, -alpha - 1, -alpha, start_time, time_limit, path_keys
+            )
+            if search_depth < child_depth and score > alpha:
+                # The reduced look says this quiet move might be better than expected — that's
+                # exactly the case LMR's depth cut isn't trustworthy for, so verify at the depth
+                # it would have gotten without the reduction before believing it.
+                score = -negamax(
+                    board, child_depth, -alpha - 1, -alpha, start_time, time_limit, path_keys
+                )
+            if alpha < score < beta:
+                score = -negamax(
+                    board, child_depth, -beta, -alpha, start_time, time_limit, path_keys
+                )
         _ACC.pop(board)
 
         if score > best_score:
@@ -494,31 +722,76 @@ def negamax(
         if best_score > alpha:
             alpha = best_score
         if alpha >= beta:
-            if not board.is_capture(move) and move.promotion is None:
+            if not is_tactical:
                 store_killer(depth, move)
             break
 
     path_keys.remove(key)
 
-    flag = "EXACT"
-    if best_score <= alpha_orig:
-        flag = "UPPER"
-    elif best_score >= beta:
-        flag = "LOWER"
+    # A score of exactly 0.0, CONTEMPT, or -CONTEMPT here can only come from a terminal draw
+    # (repetition, fifty-move, stalemate, or insufficient material) propagating up through
+    # best_score — evaluate()'s NNUE output is a continuous float that never lands on exactly one
+    # of these three. Repetition and fifty-move are both path-dependent: the same board key can
+    # be a draw via one move-order history and not via a different one that reaches the identical
+    # position, so caching a path-tainted score as EXACT would feed a stale verdict to a later
+    # search that reaches this key a different way.
+    if best_score not in (0.0, CONTEMPT, -CONTEMPT):
+        flag = "EXACT"
+        if best_score <= alpha_orig:
+            flag = "UPPER"
+        elif best_score >= beta:
+            flag = "LOWER"
 
-    TT[key] = {"depth": depth, "score": best_score, "flag": flag, "best_move": best_move_for_tt}
+        # Depth-preferred replacement: a slot holding a deeper search is worth more than this
+        # result, whether it's the same position refined earlier or an unrelated position that
+        # happens to share the index, so it's only worth evicting for equal-or-greater depth.
+        if tt_slot is None or depth >= tt_slot.depth:
+            TT[tt_index] = TTSlot(tt_sig, depth, best_score, flag, best_move_for_tt)
 
     return best_score
 
 
+def search_root(
+    board: chess.Board,
+    moves: list[chess.Move],
+    depth: int,
+    alpha: float,
+    beta: float,
+    start_time: float,
+    time_limit: float,
+    base_path_keys: set[Hashable],
+) -> tuple[float, chess.Move]:
+    """One pass over the root move list against a fixed [alpha, beta] window. The caller
+    (get_move) owns widening and retrying when the result lands on or outside that window — this
+    only ever reports what it found against the window it was given, fail-soft."""
+    best_score = -float("inf")
+    best_move = moves[0]
+
+    for move in moves:
+        _ACC.push(board, move)
+        path_keys = base_path_keys.copy()
+        score = -negamax(board, depth - 1, -beta, -alpha, start_time, time_limit, path_keys)
+        _ACC.pop(board)
+
+        if score > best_score:
+            best_score = score
+            best_move = move
+        if best_score > alpha:
+            alpha = best_score
+        if alpha >= beta:
+            break
+
+    return best_score, best_move
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
-    global GAME_HISTORY, TT, KILLERS
+    global GAME_HISTORY, KILLERS
 
     board = chess.Board(fen)
     _ACC.set_position(board)
     start_time = time.time()
     try:
-        with chess.polyglot.open_reader("book.bin") as reader:
+        with chess.polyglot.open_reader(str(BOOK_PATH)) as reader:
             book_entry = reader.choice(board)
             return book_entry.move.uci()
     except (FileNotFoundError, IndexError):
@@ -532,43 +805,62 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     base_path_keys = set(GAME_HISTORY.keys())
 
-    if len(TT) > 1000000:
-        TT = {}
-
     KILLERS = {}
 
     time_limit_sec = time_budget_sec(time_left_ms, board)
+    panic_ceiling_sec = min(time_limit_sec * PANIC_MAX_MULTIPLE, time_left_ms / 1000.0 * 0.5)
 
     moves = list(board.legal_moves)
     if not moves:
         return ""
 
     best_move = moves[0]
+    prev_score: float | None = None
+    last_depth_time = 0.0
 
     try:
         for depth in range(1, 20):
-            alpha = -float("inf")
-            beta = float("inf")
-            best_score = -float("inf")
+            elapsed_before_depth = time.time() - start_time
+            # Soft limit: if the depth just finished already suggests the next one won't fit in
+            # what's left, stop now with the last completed depth's move instead of starting a
+            # search that SearchTimeout will cut off partway through anyway — that partial work
+            # never changes the move played, so the time behind it is spent for nothing. Only
+            # engages once there's a real per-depth timing sample (depth > 1); depths 1-2 are
+            # cheap enough that this never matters for them regardless.
+            if depth > 2 and elapsed_before_depth + last_depth_time * DEPTH_COST_MULTIPLIER > (
+                time_limit_sec
+            ):
+                break
 
-            moves.sort(key=lambda m: (board.is_capture(m), m.promotion is not None), reverse=True)
-            current_best_move = moves[0]
+            moves.sort(key=lambda m: score_move(board, m, best_move.uci()), reverse=True)
 
-            for move in moves:
-                _ACC.push(board, move)
-                path_keys = base_path_keys.copy()
-                score = -negamax(
-                    board, depth - 1, -beta, -alpha, start_time, time_limit_sec, path_keys
+            # Aspiration windows: depth d-1's score is almost always close to depth d's, so start
+            # narrow around it instead of wide open — a tight window prunes far more aggressively
+            # at the root. When the result lands on the edge of the window, that's only a bound,
+            # not the true score, so the whole depth is redone with that side opened back up; the
+            # times the narrow window holds more than pay for the times it has to be redone.
+            if prev_score is not None:
+                alpha, beta = prev_score - ASPIRATION_WINDOW, prev_score + ASPIRATION_WINDOW
+            else:
+                alpha, beta = -float("inf"), float("inf")
+
+            while True:
+                best_score, current_best_move = search_root(
+                    board, moves, depth, alpha, beta, start_time, time_limit_sec, base_path_keys
                 )
-                _ACC.pop(board)
+                if best_score <= alpha and alpha != -float("inf"):
+                    alpha = -float("inf")
+                elif best_score >= beta and beta != float("inf"):
+                    beta = float("inf")
+                else:
+                    break
 
-                if score > best_score:
-                    best_score = score
-                    current_best_move = move
-                if best_score > alpha:
-                    alpha = best_score
+            if prev_score is not None and best_score < prev_score - PANIC_SCORE_DROP:
+                time_limit_sec = min(time_limit_sec * PANIC_MULTIPLIER, panic_ceiling_sec)
 
             best_move = current_best_move
+            prev_score = best_score
+            last_depth_time = (time.time() - start_time) - elapsed_before_depth
 
     except SearchTimeout:
         pass

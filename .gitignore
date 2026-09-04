@@ -10,3 +10,4 @@ submission.zip
 mlp/data/
 mlp/data_v2/
 mlp/weights*.pt
+mlp/weights*.npz
