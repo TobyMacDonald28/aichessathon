@@ -86,6 +86,7 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
 # ---------------------------------------------------------------------------
 
 WEIGHTS_PATH = Path(__file__).parent / "weights.npz"
+BOOK_PATH = Path(__file__).parent / "book.bin"
 FEATURE_TRANSFORMER_BITS = 16  # summed over up to 32 rows; int8 rounding error compounds too much
 HEAD_BITS = 8  # one matmul, not a sum of many rows — int8 rounds cleanly, and enables SIMD
 
@@ -318,9 +319,9 @@ class Accumulator:
 _ACC = Accumulator(_WEIGHTS.ft_weight)
 
 # ---------------------------------------------------------------------------
-# Search: alpha-beta negamax with a transposition table, quiescence search on captures, null-move
-# pruning, and killer-move ordering. evaluate() is the only thing that differs from a classical
-# engine — everything else here is standard.
+# Search: alpha-beta negamax with PVS, aspiration windows, a fixed-size TT, null-move pruning,
+# futility pruning, LMR, check extensions, and killer ordering; quiescence search on captures
+# pruned by SEE. evaluate() is the only non-classical piece — everything else here is standard.
 # ---------------------------------------------------------------------------
 
 class TTSlot(NamedTuple):
@@ -344,7 +345,12 @@ TT: list[TTSlot | None] = [None] * TT_SIZE
 KILLERS_PER_DEPTH = 2
 KILLERS: dict[int, list[chess.Move]] = {}
 
-SAFETY_MARGIN_MS = 50.0
+# Flag fall is an instant loss, so this errs generous: a wider margin costs a little search depth
+# on the clock, an overshoot costs the whole game. 50ms was sized for an unloaded, dedicated core;
+# it doesn't survive real scheduling jitter (a contended core, a GC pause, a slow node deep in a
+# capture-heavy Q-search position) — reproducing a flag loss from testing showed no single search
+# call anywhere near its own budget, so the shortfall was time lost between calls, not inside one.
+SAFETY_MARGIN_MS = 300.0
 MIN_TIME_LIMIT_SEC = 0.05
 
 # Futility pruning: at a frontier node (depth 1, one ply from qsearch), a quiet move that doesn't
@@ -357,6 +363,8 @@ FUTILITY_MARGIN = 200.0
 
 ASPIRATION_WINDOW = 50.0
 
+# The king can be a recapturing attacker in see()'s exchange even though it's never a capture
+# victim — overvalued here so it's always the last piece tried.
 SEE_PIECE_VALUE = {**PIECE_VALUE, chess.KING: 20000.0}
 
 
@@ -387,10 +395,16 @@ def evaluate(board: chess.Board) -> float:
 
 
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
+    # Assume the game wraps up by move 60, floored at 20 moves left so a long game never assumes
+    # too few moves remain and overspends the clock.
     expected_moves_left = max(20, 60 - board.fullmove_number)
     usable_ms = max(time_left_ms - SAFETY_MARGIN_MS, 0.0)
     budget_sec = max(usable_ms / 1000.0 / expected_moves_left, MIN_TIME_LIMIT_SEC)
-    return min(budget_sec, time_left_ms / 1000.0 * 0.5)
+    # Capped well under half the clock: the per-move share above already self-corrects as the
+    # clock drains, this cap only matters when it doesn't (a short game, a big expected-moves
+    # underestimate) — and a quarter of what's left survives many more consecutive bad guesses
+    # before the clock is in danger than a half would.
+    return min(budget_sec, time_left_ms / 1000.0 * 0.25)
 
 
 def store_killer(depth: int, move: chess.Move) -> None:
@@ -407,6 +421,8 @@ def score_move(
     tt_move_uci: str | None = None,
     killers: list[chess.Move] | None = None,
 ) -> float:
+    # Tiers widely spaced so nothing in one can outscore the next: TT move, promotions, captures,
+    # killers, then everything else falls through to 0.
     if tt_move_uci and move.uci() == tt_move_uci:
         return 1000000.0
 
@@ -552,6 +568,9 @@ def negamax(
 
     in_check = board.is_check()
 
+    # Null-move pruning: if passing the move entirely still beats beta after a shallow look, a
+    # real move can only be better, so skip this node. Skipped in check (passing isn't legal) and
+    # under 10 pieces (zugzwang endgames, where passing can be the only good move).
     if depth >= 3 and beta < MATE_SCORE and not in_check and len(board.piece_map()) > 10:
         _ACC.push(board, chess.Move.null())
         null_score = -negamax(
@@ -599,6 +618,8 @@ def negamax(
         # it shallow first, on the same null window PVS would use anyway, and only pay for a full
         # child_depth search if that shallow look says the move is worth a second look.
         search_depth = child_depth
+        # Thresholds tuned by feel: leave the first few moves and the two plies above qsearch
+        # untouched, reduce harder for moves both late and deep.
         if (
             move_index > 3
             and not is_tactical
@@ -706,7 +727,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     _ACC.set_position(board)
     start_time = time.time()
     try:
-        with chess.polyglot.open_reader("book.bin") as reader:
+        with chess.polyglot.open_reader(str(BOOK_PATH)) as reader:
             book_entry = reader.choice(board)
             return book_entry.move.uci()
     except (FileNotFoundError, IndexError):
