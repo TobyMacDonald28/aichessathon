@@ -440,9 +440,9 @@ def contempt_score(board: chess.Board) -> float:
 
 
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
-    # Assume the game wraps up by move 60, floored at 20 moves left so a long game never assumes
+    # Assume the game wraps up by move 55, floored at 15 moves left so a long game never assumes
     # too few moves remain and overspends the clock.
-    expected_moves_left = max(20, 60 - board.fullmove_number)
+    expected_moves_left = max(15, 55 - board.fullmove_number)
     usable_ms = max(time_left_ms - SAFETY_MARGIN_MS, 0.0)
     budget_sec = max(usable_ms / 1000.0 / expected_moves_left, MIN_TIME_LIMIT_SEC)
     # Capped well under half the clock: the per-move share above already self-corrects as the
