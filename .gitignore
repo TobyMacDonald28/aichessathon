@@ -1,4 +1,5 @@
 .venv/
+.venv-linux/
 __pycache__/
 .mypy_cache/
 .ruff_cache/
@@ -7,4 +8,5 @@ submission.zip
 
 # training data/weights: large, regenerable via mlp/train.py, not meant to be committed
 mlp/data/
+mlp/data_v2/
 mlp/weights*.pt

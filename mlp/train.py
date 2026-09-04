@@ -2,8 +2,13 @@
 
 Two phases, run separately so a slow download never has to repeat while you iterate on the model:
 
-    python train.py fetch --positions 1000000      # streams a sample into mlp/data/
-    python train.py fit --epochs 20                # trains on mlp/data/, writes weights.pt
+    python train.py fetch --positions 1000000      # streams a sample into mlp/data_v2/
+    python train.py fit --epochs 20                # trains on mlp/data_v2/, writes weights.pt
+
+`--data-dir` overrides the dataset location on both (default mlp/data_v2/) — the original
+mlp/data/ predates castling features (different MAX_ACTIVE row width, so it's not just
+missing phase.f32, it's binary-incompatible with the fetch/fit code below) and is kept around
+untouched rather than overwritten, not as something to point `--data-dir` back at.
 
 Data source: https://database.lichess.org/#evals (CC0) — about 395M Stockfish-annotated
 positions in a single ~20 GB zstd-compressed JSONL file, one line per position, each carrying one
@@ -29,17 +34,15 @@ import numpy as np
 import torch
 from torch import nn
 
-DATA_DIR = Path(__file__).parent / "data"
-STM_INDICES_PATH = DATA_DIR / "stm_indices.i32"
-NSTM_INDICES_PATH = DATA_DIR / "nstm_indices.i32"
-TARGETS_PATH = DATA_DIR / "targets.f32"
-COUNT_PATH = DATA_DIR / "count.npy"
+DATA_DIR = Path(__file__).parent / "data_v2"
 WEIGHTS_PATH = Path(__file__).parent / "weights.pt"
 
 EVAL_URL = "https://database.lichess.org/lichess_db_eval.jsonl.zst"
 TARGET_CLIP_CP = 1000.0
 MIN_DEPTH = 16
 WDL_SCALE_CP = 400.0  # centipawns that map to a 1-sigma shift in sigmoid win-probability space
+SCORE_CP_LIMIT = 800.0  # drop positions this sharp/near-decisive, raw score, before any clipping
+DEPTH_GAP_CP_LIMIT = 50.0  # max disagreement between a shallow(>=MIN_DEPTH) and the deepest pass
 
 # ---------------------------------------------------------------------------
 # HalfKP feature encoding: the thing that makes this NNUE rather than a plain
@@ -48,7 +51,8 @@ WDL_SCALE_CP = 400.0  # centipawns that map to a 1-sigma shift in sigmoid win-pr
 # <king square>" — so the same knight-on-f3 fact is a different feature
 # depending on where the viewer's own king is. Kings themselves aren't
 # encoded as pieces (that's the "half" in HalfKP): the king square is the
-# anchor the other 40,960 features are relative to, not a feature itself.
+# anchor the 40,960 piece features are relative to, not a feature itself.
+# 4 more features (see castling_indices below) round FEATURE_DIM out to 40,964.
 # ---------------------------------------------------------------------------
 
 PIECE_INDEX_NO_KING = {
@@ -58,15 +62,33 @@ PIECE_INDEX_NO_KING = {
     chess.ROOK: 3,
     chess.QUEEN: 4,
 }
-FEATURE_DIM = 64 * 64 * 10  # king square x piece square x (5 piece types x friend/foe)
+PIECE_FEATURE_DIM = 64 * 64 * 10  # king square x piece square x (5 piece types x friend/foe)
+
+# Castling rights as 4 global facts — (mine/theirs) x (kingside/queenside) — appended after the
+# piece-feature block. Unlike every other HalfKP feature these are deliberately NOT multiplied by
+# king_square: "I can still castle kingside" is one fact, true or false, not 64 different facts
+# depending on exactly which square my king happens to occupy. Each is a single fixed embedding
+# row, present or absent in the EmbeddingBag sum like any other active feature.
+CASTLING_FEATURE_DIM = 4
+FEATURE_DIM = PIECE_FEATURE_DIM + CASTLING_FEATURE_DIM
 PAD_INDEX = FEATURE_DIM  # one extra embedding row, held at zero, for padding short bags
-MAX_ACTIVE = 32  # a legal position has at most 30 non-king pieces
+MAX_ACTIVE = 34  # <=30 non-king pieces + <=4 simultaneously-active castling-right facts
 
 
 def _orient(square: int, perspective: bool) -> int:
     """Square as seen by `perspective`: mirrored vertically when that side is Black, so the
     board always "looks like" it's being viewed from the bottom, same as the MLP's mirroring."""
     return square if perspective == chess.WHITE else chess.square_mirror(square)
+
+
+def castling_indices(board: chess.Board, perspective: bool) -> list[int]:
+    indices = []
+    for relative_color, color in ((0, perspective), (1, not perspective)):
+        if board.has_kingside_castling_rights(color):
+            indices.append(PIECE_FEATURE_DIM + relative_color * 2 + 0)
+        if board.has_queenside_castling_rights(color):
+            indices.append(PIECE_FEATURE_DIM + relative_color * 2 + 1)
+    return indices
 
 
 def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
@@ -79,6 +101,7 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
         relative_color = 0 if piece.color == perspective else 1
         combined_type = relative_color * 5 + PIECE_INDEX_NO_KING[piece.piece_type]
         indices.append(king_square * 640 + piece_square * 10 + combined_type)
+    indices.extend(castling_indices(board, perspective))
     return indices
 
 
@@ -167,6 +190,12 @@ def _is_quiet(board: chess.Board, pv: dict) -> bool:
     line = pv.get("line")
     if not line:
         return True
+    # pv["line"] is UCI_Chess960 notation (castling as king-takes-own-rook, e.g. "e1h1") even
+    # though these are standard-chess positions — without chess960 mode a castling move fails to
+    # parse as any legal move at all, silently falling through to "assume quiet" below. That
+    # happens to be the right answer for castling specifically (it's never a capture), but by
+    # accident of the exception handler rather than because the move was understood.
+    board.chess960 = True
     try:
         move = board.parse_uci(line.split()[0])
     except ValueError:
@@ -174,12 +203,74 @@ def _is_quiet(board: chess.Board, pv: dict) -> bool:
     return not (board.is_capture(move) or move.promotion or board.gives_check(move))
 
 
-def fetch(num_positions: int, sample_every: int) -> None:
+def _raw_cp(pv: dict) -> float | None:
+    """The PV's raw score, unclipped — None for a mate line (unbounded magnitude, the single most
+    decisive category there is, so it fails any cp-magnitude filter by construction)."""
+    if "mate" in pv:
+        return None
+    cp = pv.get("cp")
+    return float(cp) if cp is not None else None
+
+
+def _depth_disagreement(evals: list[dict], deepest: dict, min_depth: int) -> float | None:
+    """|cp gap| between `deepest` (the entry _best_eval already picked) and the shallowest *other*
+    pass that still clears min_depth, reusing whatever multi-pass data the dump already has for
+    this position rather than running a fresh search. None when there's no second qualifying pass
+    to compare against — a position isn't unstable for the sole reason nobody happened to
+    re-analyze it a second time, so it's kept rather than penalized for that. A shallower pass
+    claiming mate counts as maximal disagreement: a mate mirage that more search resolves away is
+    exactly the instability this filter exists to catch."""
+    qualifying = [
+        e for e in evals if e is not deepest and e.get("depth", 0) >= min_depth and e.get("pvs")
+    ]
+    if not qualifying:
+        return None
+    shallow_pv = min(qualifying, key=lambda e: e.get("depth", 0))["pvs"][0]
+    if "mate" in shallow_pv:
+        return float("inf")
+    shallow_cp = shallow_pv.get("cp")
+    deep_cp = deepest["pvs"][0].get("cp")
+    if shallow_cp is None or deep_cp is None:
+        return None
+    return abs(shallow_cp - deep_cp)
+
+
+# Both sides' non-pawn material at a full board: 2 knights + 2 bishops + 2 rooks + 1 queen, per
+# side. Same piece-value scale as agent.py's search-time PIECE_VALUE, just for a different purpose
+# here (a phase signal, not move ordering).
+PHASE_PIECE_VALUE = {
+    chess.KNIGHT: 320.0,
+    chess.BISHOP: 330.0,
+    chess.ROOK: 500.0,
+    chess.QUEEN: 900.0,
+}
+STARTING_NON_PAWN_MATERIAL = 2 * (2 * 320.0 + 2 * 330.0 + 2 * 500.0 + 900.0)
+
+
+def phase_tag(board: chess.Board) -> float:
+    """Non-pawn material still on the board (both sides), normalized against the starting total:
+    1.0 at the game's start, trending toward 0.0 as pieces (not pawns) come off. A cheap proxy for
+    how "middlegame" vs "endgame" a position is — captured now for later phase-stratified sampling
+    or a phase-interpolated output head, neither built yet, just the signal."""
+    material = sum(
+        len(board.pieces(piece_type, color)) * value
+        for piece_type, value in PHASE_PIECE_VALUE.items()
+        for color in (chess.WHITE, chess.BLACK)
+    )
+    return material / STARTING_NON_PAWN_MATERIAL
+
+
+def fetch(num_positions: int, sample_every: int, data_dir: Path = DATA_DIR) -> None:
     """Streams the eval dump, keeping one position every `sample_every` lines seen, until
     `num_positions` positions have been kept. sample_every=1 takes a prefix of the file, which is
     fast but whatever ordering Lichess wrote the dump in; a larger value spreads the sample over
     more of the file at the cost of reading (and discarding) more of the stream."""
-    DATA_DIR.mkdir(exist_ok=True)
+    data_dir.mkdir(exist_ok=True)
+    stm_path = data_dir / "stm_indices.i32"
+    nstm_path = data_dir / "nstm_indices.i32"
+    targets_path = data_dir / "targets.f32"
+    phase_path = data_dir / "phase.f32"
+    count_path = data_dir / "count.npy"
 
     curl = subprocess.Popen(["curl", "-s", EVAL_URL], stdout=subprocess.PIPE)
     zstd = subprocess.Popen(["zstd", "-dc"], stdin=curl.stdout, stdout=subprocess.PIPE)
@@ -188,11 +279,22 @@ def fetch(num_positions: int, sample_every: int) -> None:
 
     kept = 0
     seen = 0
+    # Cheapest filters first (pure dict access, no Board needed) so an expensive board construction
+    # + move parse only happens for candidates that already cleared the free checks.
+    dropped = {
+        "depth": 0,
+        "score_magnitude": 0,
+        "depth_disagreement": 0,
+        "not_quiet": 0,
+        "no_target": 0,
+        "too_many_pieces": 0,
+    }
     try:
         with (
-            open(STM_INDICES_PATH, "wb") as stm_out,
-            open(NSTM_INDICES_PATH, "wb") as nstm_out,
-            open(TARGETS_PATH, "wb") as target_out,
+            open(stm_path, "wb") as stm_out,
+            open(nstm_path, "wb") as nstm_out,
+            open(targets_path, "wb") as target_out,
+            open(phase_path, "wb") as phase_out,
         ):
             assert zstd.stdout is not None
             for raw_line in zstd.stdout:
@@ -204,16 +306,36 @@ def fetch(num_positions: int, sample_every: int) -> None:
                 except json.JSONDecodeError:
                     continue
 
-                entry = _best_eval(row.get("evals", []))
+                evals = row.get("evals", [])
+                entry = _best_eval(evals)
                 if entry is None or entry.get("depth", 0) < MIN_DEPTH:
+                    dropped["depth"] += 1
+                    continue
+
+                pvs = entry.get("pvs")
+                if not pvs:
+                    dropped["depth"] += 1
+                    continue
+                pv = pvs[0]
+
+                raw_cp = _raw_cp(pv)
+                if raw_cp is None or abs(raw_cp) > SCORE_CP_LIMIT:
+                    dropped["score_magnitude"] += 1
+                    continue
+
+                gap = _depth_disagreement(evals, entry, MIN_DEPTH)
+                if gap is not None and gap > DEPTH_GAP_CP_LIMIT:
+                    dropped["depth_disagreement"] += 1
                     continue
 
                 board = chess.Board(_pad_fen(row["fen"]))
-                if not _is_quiet(board, (entry.get("pvs") or [{}])[0]):
+                if not _is_quiet(board, pv):
+                    dropped["not_quiet"] += 1
                     continue
 
                 target = _target_cp(entry, board.turn == chess.WHITE)
                 if target is None:
+                    dropped["no_target"] += 1
                     continue
 
                 # The eval dump includes board-editor setups, not just game positions, so piece
@@ -221,11 +343,13 @@ def fetch(num_positions: int, sample_every: int) -> None:
                 stm = halfkp_indices(board, board.turn)
                 nstm = halfkp_indices(board, not board.turn)
                 if len(stm) > MAX_ACTIVE or len(nstm) > MAX_ACTIVE:
+                    dropped["too_many_pieces"] += 1
                     continue
 
                 stm_out.write(_padded(stm).tobytes())
                 nstm_out.write(_padded(nstm).tobytes())
                 target_out.write(np.float32(target).tobytes())
+                phase_out.write(np.float32(phase_tag(board)).tobytes())
 
                 kept += 1
                 if kept % 50000 == 0:
@@ -236,8 +360,9 @@ def fetch(num_positions: int, sample_every: int) -> None:
         zstd.kill()
         curl.kill()
 
-    np.save(COUNT_PATH, np.array([kept], dtype=np.int64))
+    np.save(count_path, np.array([kept], dtype=np.int64))
     print(f"done: kept {kept} positions from {seen} lines seen", file=sys.stderr)
+    print(f"dropped by filter: {dropped}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -274,14 +399,24 @@ def _wdl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def fit(
-    epochs: int, batch_size: int, lr: float, val_fraction: float, device: str, output: str | None
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    val_fraction: float,
+    device: str,
+    output: str | None,
+    data_dir: Path = DATA_DIR,
 ) -> None:
-    count = int(np.load(COUNT_PATH)[0])
-    stm_indices = np.memmap(STM_INDICES_PATH, dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE))
-    nstm_indices = np.memmap(
-        NSTM_INDICES_PATH, dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE)
+    count = int(np.load(data_dir / "count.npy")[0])
+    stm_indices = np.memmap(
+        data_dir / "stm_indices.i32", dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE)
     )
-    targets = np.memmap(TARGETS_PATH, dtype=np.float32, mode="r", shape=(count,))
+    nstm_indices = np.memmap(
+        data_dir / "nstm_indices.i32", dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE)
+    )
+    targets = np.memmap(data_dir / "targets.f32", dtype=np.float32, mode="r", shape=(count,))
+    # phase.f32 (data_dir / "phase.f32") is captured by fetch() but not consumed here yet -- for
+    # later phase-stratified sampling or a phase-interpolated head, neither built yet.
 
     rng = np.random.default_rng(0)
     order = rng.permutation(count)
@@ -375,6 +510,12 @@ def main() -> None:
     fetch_parser = subparsers.add_parser("fetch")
     fetch_parser.add_argument("--positions", type=int, default=1_000_000)
     fetch_parser.add_argument("--sample-every", type=int, default=1)
+    fetch_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DATA_DIR,
+        help="where to write the dataset (default mlp/data_v2/) -- never overwrites mlp/data/",
+    )
 
     fit_parser = subparsers.add_parser("fit")
     fit_parser.add_argument("--epochs", type=int, default=20)
@@ -388,10 +529,13 @@ def main() -> None:
         help="weights filename under mlp/ (default: auto-named from epochs/batch-size/timestamp "
         "so runs don't clobber each other; pass 'weights.pt' explicitly to promote a run)",
     )
+    fit_parser.add_argument(
+        "--data-dir", type=Path, default=DATA_DIR, help="dataset to train on (default mlp/data_v2/)"
+    )
 
     arguments = parser.parse_args()
     if arguments.command == "fetch":
-        fetch(arguments.positions, arguments.sample_every)
+        fetch(arguments.positions, arguments.sample_every, arguments.data_dir)
     else:
         fit(
             arguments.epochs,
@@ -400,6 +544,7 @@ def main() -> None:
             arguments.val_fraction,
             arguments.device,
             arguments.output,
+            arguments.data_dir,
         )
 
 
