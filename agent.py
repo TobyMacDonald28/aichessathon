@@ -33,8 +33,11 @@ PIECE_VALUE = {
 # ---------------------------------------------------------------------------
 # HalfKP feature encoding: a feature is "there is a <piece type, friend-or-foe> on <square>, given
 # my king is on <king square>", computed once per side per position. Kings aren't features
-# themselves (that's the "half" in HalfKP) — the king square is the anchor the other 40,960
-# features are relative to.
+# themselves (that's the "half" in HalfKP) — the king square is the anchor the 40,960 piece
+# features are relative to. 4 more features (see castling_indices below) round FEATURE_DIM out to
+# 40,964: each side's castling rights, which unlike every piece feature are deliberately NOT
+# multiplied by king_square — "I can still castle kingside" is one fact, true or false, not 64
+# different facts depending on exactly which square my king happens to occupy.
 # ---------------------------------------------------------------------------
 
 ACCUMULATOR_DIM = 256
@@ -46,12 +49,25 @@ PIECE_INDEX_NO_KING = {
     chess.ROOK: 3,
     chess.QUEEN: 4,
 }
+PIECE_FEATURE_DIM = 64 * 64 * 10
+CASTLING_FEATURE_DIM = 4
+FEATURE_DIM = PIECE_FEATURE_DIM + CASTLING_FEATURE_DIM
 
 
 def _orient(square: int, perspective: bool) -> int:
     """Square as seen by `perspective`: mirrored vertically when that side is Black, so the board
     always "looks like" it's being viewed from the bottom."""
     return square if perspective == chess.WHITE else chess.square_mirror(square)
+
+
+def castling_indices(board: chess.Board, perspective: bool) -> list[int]:
+    indices = []
+    for relative_color, color in ((0, perspective), (1, not perspective)):
+        if board.has_kingside_castling_rights(color):
+            indices.append(PIECE_FEATURE_DIM + relative_color * 2 + 0)
+        if board.has_queenside_castling_rights(color):
+            indices.append(PIECE_FEATURE_DIM + relative_color * 2 + 1)
+    return indices
 
 
 def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
@@ -66,6 +82,7 @@ def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
         relative_color = 0 if piece.color == perspective else 1
         combined_type = relative_color * 5 + PIECE_INDEX_NO_KING[piece.piece_type]
         indices.append(king_square * 640 + piece_square * 10 + combined_type)
+    indices.extend(castling_indices(board, perspective))
     return indices
 
 
@@ -261,6 +278,47 @@ def _apply(
             acc -= weight[index]
 
 
+CastlingRights = tuple[bool, bool, bool, bool]  # (white KS, white QS, black KS, black QS)
+_CASTLING_LABELS: tuple[tuple[bool, int], ...] = (
+    (chess.WHITE, 0),
+    (chess.WHITE, 1),
+    (chess.BLACK, 0),
+    (chess.BLACK, 1),
+)
+
+
+def _castling_rights(board: chess.Board) -> CastlingRights:
+    return (
+        board.has_kingside_castling_rights(chess.WHITE),
+        board.has_queenside_castling_rights(chess.WHITE),
+        board.has_kingside_castling_rights(chess.BLACK),
+        board.has_queenside_castling_rights(chess.BLACK),
+    )
+
+
+def _lost_castling_rights(before: CastlingRights, after: CastlingRights) -> list[tuple[bool, int]]:
+    """(color, right) pairs — right 0=kingside, 1=queenside — present in `before` but gone in
+    `after`. This diffs python-chess's own has_*_castling_rights() across the push rather than
+    hand-coding "king moved" / "rook moved off its home square" / "rook got captured on its home
+    square" ourselves — that reuses logic python-chess already gets right (including the
+    easy-to-miss case of a rook lost by capture without ever having moved) instead of duplicating
+    it, and it's the only way a right can ever change: castling rights never come back once lost,
+    so there's no symmetric "gained" case to handle."""
+    return [
+        label
+        for label, was, now in zip(_CASTLING_LABELS, before, after, strict=True)
+        if was and not now
+    ]
+
+
+def _apply_castling_losses(
+    acc: np.ndarray, weight: np.ndarray, perspective: bool, lost: list[tuple[bool, int]]
+) -> None:
+    for color, right in lost:
+        relative_color = 0 if color == perspective else 1
+        acc -= weight[PIECE_FEATURE_DIM + relative_color * 2 + right]
+
+
 class Accumulator:
     """Owns both perspectives' running accumulator and the board itself, so the two can never
     drift out of sync: every push/pop goes through here instead of `board.push`/`board.pop`."""
@@ -297,6 +355,7 @@ class Accumulator:
             return
 
         updates, king_moved_color = move_updates(board, move)
+        rights_before = _castling_rights(board)
         for perspective, acc in ((chess.WHITE, self.white_acc), (chess.BLACK, self.black_acc)):
             if perspective == king_moved_color:
                 continue
@@ -305,6 +364,16 @@ class Accumulator:
             _apply(acc, self.weight, perspective, king, updates)
 
         board.push(move)
+
+        lost_rights = _lost_castling_rights(rights_before, _castling_rights(board))
+        if lost_rights:
+            for perspective, acc in (
+                (chess.WHITE, self.white_acc),
+                (chess.BLACK, self.black_acc),
+            ):
+                if perspective == king_moved_color:
+                    continue  # gets a full refresh below, which reflects the new rights anyway
+                _apply_castling_losses(acc, self.weight, perspective, lost_rights)
 
         if king_moved_color == chess.WHITE:
             self.white_acc = self._full(board, chess.WHITE)
