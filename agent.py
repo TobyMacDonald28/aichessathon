@@ -363,6 +363,26 @@ FUTILITY_MARGIN = 200.0
 
 ASPIRATION_WINDOW = 50.0
 
+# How much costlier the next depth is assumed to be than the one just finished, for deciding
+# whether to even attempt it. Real ratios vary a lot in practice (TT hits and aspiration windows
+# can make a depth much cheaper than a raw branching-factor estimate suggests), so this errs on
+# the low side deliberately: better to occasionally skip a depth that would have finished than to
+# routinely start one that can't, burns most of the remaining budget getting cut off mid-search,
+# and produces a move no better than the one already in hand.
+DEPTH_COST_MULTIPLIER = 3.0
+
+# Panic extension: a root score that craters between depths means the move that looked fine a ply
+# shallower might actually blunder, so it's worth stealing time from later moves to resolve that
+# now instead of getting cut off mid-crisis. Capped on two axes so a panic can never become a
+# time-safety risk: at most PANIC_MAX_MULTIPLE times the move's original budget, and never more
+# than half of whatever is actually left on the clock, whichever is smaller — the second cap is
+# what matters late in a game, when even a full multiple of the (by-then small) per-move budget
+# would otherwise still be safe in isolation but risky repeated over several panicky moves in a
+# row.
+PANIC_SCORE_DROP = 100.0
+PANIC_MULTIPLIER = 2.0
+PANIC_MAX_MULTIPLE = 3.0
+
 # Contempt: a repetition or fifty-move draw scores as a small loss for whoever's ahead on
 # material and a small gain for whoever's behind, instead of a flat 0. Search depth can't always
 # tell a genuine dead end apart from a slow-burning winning plan — both look equally flat within
@@ -526,20 +546,35 @@ def qsearch(
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
-    stand_pat = evaluate(board)
-    if stand_pat >= beta:
-        return beta
-    if alpha < stand_pat:
-        alpha = stand_pat
+    in_check = board.is_check()
 
-    captures = list(board.generate_legal_captures())
+    # Standing pat means "the position is at least this good even if I do nothing" — not a
+    # legal option while in check, since doing nothing isn't legal there. Skipping it also means
+    # generate_legal_captures() would silently miss the position entirely if it has no captures at
+    # all (a checkmate, or an escape that isn't a capture), so those get handled explicitly below.
+    if not in_check:
+        stand_pat = evaluate(board)
+        if stand_pat >= beta:
+            return beta
+        if alpha < stand_pat:
+            alpha = stand_pat
+
+    # generate_legal_captures() filters the *legal* move list down to captures — while in check,
+    # that legal list is already just evasions, so this silently drops any evasion that isn't a
+    # capture (a king step, a block). Search the full evasion list instead so those aren't missed.
+    moves = list(board.legal_moves) if in_check else list(board.generate_legal_captures())
+    if in_check and not moves:
+        return -MATE_SCORE + len(board.move_stack)
+
     # Sorted by SEE value, best exchange first, so the loop below can stop the instant it reaches
     # a losing capture instead of exploring it — that's most of the point, this is where a
-    # Q-search spends the bulk of its time otherwise.
-    scored = sorted(((see(board, m), m) for m in captures), key=lambda p: p[0], reverse=True)
+    # Q-search spends the bulk of its time otherwise. Not a real exchange value for a quiet
+    # evasion, but see() degrades to 0.0 for those (no piece captured, nothing to swap), which
+    # keeps them ahead of genuinely losing captures without pruning them.
+    scored = sorted(((see(board, m), m) for m in moves), key=lambda p: p[0], reverse=True)
 
     for see_value, move in scored:
-        if see_value < 0:
+        if see_value < 0 and not in_check:
             break
 
         _ACC.push(board, move)
@@ -599,7 +634,7 @@ def negamax(
     # Null-move pruning: if passing the move entirely still beats beta after a shallow look, a
     # real move can only be better, so skip this node. Skipped in check (passing isn't legal) and
     # under 10 pieces (zugzwang endgames, where passing can be the only good move).
-    if depth >= 3 and beta < MATE_SCORE and not in_check and len(board.piece_map()) > 10:
+    if depth >= 3 and beta < MATE_SCORE and not in_check and chess.popcount(board.occupied) > 10:
         _ACC.push(board, chess.Move.null())
         null_score = -negamax(
             board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys
@@ -773,6 +808,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     KILLERS = {}
 
     time_limit_sec = time_budget_sec(time_left_ms, board)
+    panic_ceiling_sec = min(time_limit_sec * PANIC_MAX_MULTIPLE, time_left_ms / 1000.0 * 0.5)
 
     moves = list(board.legal_moves)
     if not moves:
@@ -780,9 +816,22 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     best_move = moves[0]
     prev_score: float | None = None
+    last_depth_time = 0.0
 
     try:
         for depth in range(1, 20):
+            elapsed_before_depth = time.time() - start_time
+            # Soft limit: if the depth just finished already suggests the next one won't fit in
+            # what's left, stop now with the last completed depth's move instead of starting a
+            # search that SearchTimeout will cut off partway through anyway — that partial work
+            # never changes the move played, so the time behind it is spent for nothing. Only
+            # engages once there's a real per-depth timing sample (depth > 1); depths 1-2 are
+            # cheap enough that this never matters for them regardless.
+            if depth > 2 and elapsed_before_depth + last_depth_time * DEPTH_COST_MULTIPLIER > (
+                time_limit_sec
+            ):
+                break
+
             moves.sort(key=lambda m: score_move(board, m, best_move.uci()), reverse=True)
 
             # Aspiration windows: depth d-1's score is almost always close to depth d's, so start
@@ -806,8 +855,12 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 else:
                     break
 
+            if prev_score is not None and best_score < prev_score - PANIC_SCORE_DROP:
+                time_limit_sec = min(time_limit_sec * PANIC_MULTIPLIER, panic_ceiling_sec)
+
             best_move = current_best_move
             prev_score = best_score
+            last_depth_time = (time.time() - start_time) - elapsed_before_depth
 
     except SearchTimeout:
         pass
