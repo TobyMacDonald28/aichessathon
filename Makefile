@@ -10,7 +10,7 @@ play:
 
 
 arena:
-	uv run python -m harness.arena --opponent baselines/v1 --games 20
+	uv run python -m harness.arena --opponent baselines/pre-pvs --games 20
 
 zip:
 	uv run python -m harness.package --include weights.npz --include book.bin

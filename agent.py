@@ -363,6 +363,13 @@ FUTILITY_MARGIN = 200.0
 
 ASPIRATION_WINDOW = 50.0
 
+# Contempt: a repetition or fifty-move draw scores as a small loss for whoever's ahead on
+# material and a small gain for whoever's behind, instead of a flat 0. Search depth can't always
+# tell a genuine dead end apart from a slow-burning winning plan — both look equally flat within
+# the horizon — so this doesn't teach the engine to find the win, it just stops a provable draw
+# from looking as good as everything else when there's a material edge to protect.
+CONTEMPT = 30.0
+
 # The king can be a recapturing attacker in see()'s exchange even though it's never a capture
 # victim — overvalued here so it's always the last piece tried.
 SEE_PIECE_VALUE = {**PIECE_VALUE, chess.KING: 20000.0}
@@ -392,6 +399,24 @@ def evaluate(board: chess.Board) -> float:
         return 0.0
     x = _ACC.accumulators_for(board.turn)
     return evaluate_head(x, _WEIGHTS)
+
+
+def material_balance(board: chess.Board, perspective: bool) -> float:
+    """Raw material count for `perspective` minus the opponent's, in PIECE_VALUE units. Used only
+    for contempt — deliberately simpler and cheaper than evaluate(), since it just needs to know
+    who's ahead, not by how much or why."""
+    opponent = not perspective
+    return sum(
+        value * (len(board.pieces(pt, perspective)) - len(board.pieces(pt, opponent)))
+        for pt, value in PIECE_VALUE.items()
+    )
+
+
+def contempt_score(board: chess.Board) -> float:
+    """Score a drawn position (repetition or the fifty-move rule) relative to the side to move:
+    a small loss if they're materially ahead, a small gain if they're behind, flat if level."""
+    balance = material_balance(board, board.turn)
+    return -CONTEMPT if balance > 0 else CONTEMPT if balance < 0 else 0.0
 
 
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
@@ -543,8 +568,11 @@ def negamax(
 
     key = board._transposition_key()
 
-    if GAME_HISTORY[key] >= 2 or key in path_keys:
-        return 0.0
+    # is_fifty_moves() is halfmove_clock >= 100 with a built-in check that no other means of
+    # ending the game (checkmate, stalemate) takes precedence — exactly the guard this needs,
+    # since a quiet 100th half-move can just as easily be mate as a non-event.
+    if GAME_HISTORY[key] >= 2 or key in path_keys or board.is_fifty_moves():
+        return contempt_score(board)
 
     alpha_orig = alpha
     tt_move_uci = None
@@ -665,13 +693,14 @@ def negamax(
 
     path_keys.remove(key)
 
-    # A score of exactly 0.0 here can only come from a terminal draw (repetition, stalemate, or
-    # insufficient material) propagating up through best_score — evaluate()'s NNUE output is a
-    # continuous float that never lands on exactly 0.0. Repetition specifically is path-dependent:
-    # the same board key can be a draw via one move-order history and not a draw via a different
-    # one that reaches the identical position, so caching a repetition-tainted 0.0 as EXACT would
-    # feed a stale "it's a draw" verdict to a later search that reaches this key a different way.
-    if best_score != 0.0:
+    # A score of exactly 0.0, CONTEMPT, or -CONTEMPT here can only come from a terminal draw
+    # (repetition, fifty-move, stalemate, or insufficient material) propagating up through
+    # best_score — evaluate()'s NNUE output is a continuous float that never lands on exactly one
+    # of these three. Repetition and fifty-move are both path-dependent: the same board key can
+    # be a draw via one move-order history and not via a different one that reaches the identical
+    # position, so caching a path-tainted score as EXACT would feed a stale verdict to a later
+    # search that reaches this key a different way.
+    if best_score not in (0.0, CONTEMPT, -CONTEMPT):
         flag = "EXACT"
         if best_score <= alpha_orig:
             flag = "UPPER"
