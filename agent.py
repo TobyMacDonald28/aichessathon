@@ -363,25 +363,23 @@ FUTILITY_MARGIN = 200.0
 
 ASPIRATION_WINDOW = 50.0
 
-# How much costlier the next depth is assumed to be than the one just finished, for deciding
-# whether to even attempt it. Real ratios vary a lot in practice (TT hits and aspiration windows
-# can make a depth much cheaper than a raw branching-factor estimate suggests), so this errs on
-# the low side deliberately: better to occasionally skip a depth that would have finished than to
-# routinely start one that can't, burns most of the remaining budget getting cut off mid-search,
-# and produces a move no better than the one already in hand.
-DEPTH_COST_MULTIPLIER = 3.0
-
 # Panic extension: a root score that craters between depths means the move that looked fine a ply
 # shallower might actually blunder, so it's worth stealing time from later moves to resolve that
-# now instead of getting cut off mid-crisis. Capped on two axes so a panic can never become a
-# time-safety risk: at most PANIC_MAX_MULTIPLE times the move's original budget, and never more
-# than half of whatever is actually left on the clock, whichever is smaller — the second cap is
-# what matters late in a game, when even a full multiple of the (by-then small) per-move budget
-# would otherwise still be safe in isolation but risky repeated over several panicky moves in a
-# row.
+# now instead of getting cut off mid-crisis. (Tried also triggering this on the best move simply
+# changing between depths — that fires on nearly every iterative-deepening step as the search
+# naturally refines its answer, not just on genuine instability, so it kept re-triggering and
+# ratcheting the budget straight up to the ceiling on ordinary positions. Reverted; score-drop
+# alone is the rare, meaningful signal.)
+# Capped on two axes so a panic can never become a time-safety risk: at most PANIC_MAX_MULTIPLE
+# times the move's original budget, and never more than half of whatever is actually left on the
+# clock, whichever is smaller. The half-clock cap is what's meant to matter late in a game — but at
+# a small enough per-move budget (deep time pressure), PANIC_MAX_MULTIPLE x that budget can end up
+# far below the half-clock cap and become the real (too-tight) limit instead, precisely when a
+# panic is most needed. PANIC_MAX_MULTIPLE is set high enough that the half-clock cap stays the
+# binding one across realistic time-pressure scenarios, not just early/mid-game ones.
 PANIC_SCORE_DROP = 100.0
 PANIC_MULTIPLIER = 2.0
-PANIC_MAX_MULTIPLE = 3.0
+PANIC_MAX_MULTIPLE = 8.0
 
 # Contempt: a repetition or fifty-move draw scores as a small loss for whoever's ahead on
 # material and a small gain for whoever's behind, instead of a flat 0. Search depth can't always
@@ -816,22 +814,27 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     best_move = moves[0]
     prev_score: float | None = None
-    last_depth_time = 0.0
 
     try:
-        for depth in range(1, 20):
-            elapsed_before_depth = time.time() - start_time
-            # Soft limit: if the depth just finished already suggests the next one won't fit in
-            # what's left, stop now with the last completed depth's move instead of starting a
-            # search that SearchTimeout will cut off partway through anyway — that partial work
-            # never changes the move played, so the time behind it is spent for nothing. Only
-            # engages once there's a real per-depth timing sample (depth > 1); depths 1-2 are
-            # cheap enough that this never matters for them regardless.
-            if depth > 2 and elapsed_before_depth + last_depth_time * DEPTH_COST_MULTIPLIER > (
-                time_limit_sec
-            ):
-                break
-
+        # 100, not some smaller nominal cap: a forcing position (checks, narrow threats — often
+        # exactly what makes a position critical) can blow through a shallow depth cap in a
+        # fraction of the time budget via alpha-beta + move ordering, at which point the loop
+        # would just exhaust itself and stop with time still on the clock — the depth cap becoming
+        # the thing that ends the search instead of SearchTimeout below, which is what's actually
+        # supposed to decide when to stop. 100 plies is not a realistic search depth for this
+        # engine's speed at any real per-move budget, so in practice this never binds; it's a
+        # safety ceiling against a runaway loop, not a working limit.
+        #
+        # No predictive "will the next depth even fit?" skip here on purpose (there used to be
+        # one, based on a fixed multiple of the last depth's cost) — measured per-depth cost growth
+        # across a handful of real positions ranged from 1.16x to 10.6x, too wide for any fixed
+        # multiplier to represent, and the two failure directions aren't symmetric: attempting a
+        # depth that gets cut off by SearchTimeout costs at most one node's worth of overrun (the
+        # timeout check runs at the top of every node) and simply falls back to the last completed
+        # depth's move, while skipping a depth that would have finished wastes real budget for
+        # nothing in return. Always attempting the next depth and letting SearchTimeout bound the
+        # worst case dominates guessing wrong in the expensive direction.
+        for depth in range(1, 100):
             moves.sort(key=lambda m: score_move(board, m, best_move.uci()), reverse=True)
 
             # Aspiration windows: depth d-1's score is almost always close to depth d's, so start
@@ -860,7 +863,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
             best_move = current_best_move
             prev_score = best_score
-            last_depth_time = (time.time() - start_time) - elapsed_before_depth
 
     except SearchTimeout:
         pass
