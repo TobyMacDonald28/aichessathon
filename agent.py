@@ -71,17 +71,28 @@ def castling_indices(board: chess.Board, perspective: bool) -> list[int]:
 
 
 def halfkp_indices(board: chess.Board, perspective: bool) -> list[int]:
+    """Same result as iterating board.piece_map(), just without building it: piece_map() builds a
+    full {square: Piece} dict (one Piece object allocated per occupied square) purely so this can
+    immediately throw it away after reading two attributes off each one. Scanning each piece type's
+    own bitboard directly gets the same (square, piece_type, color) facts with no dict and no Piece
+    objects — this runs on every full accumulator recompute, i.e. every king move, so it's worth
+    avoiding the allocation. Order doesn't matter: these indices only ever get summed."""
     king = board.king(perspective)
     assert king is not None
     king_square = _orient(king, perspective)
     indices = []
-    for square, piece in board.piece_map().items():
-        if piece.piece_type == chess.KING:
-            continue
-        piece_square = _orient(square, perspective)
-        relative_color = 0 if piece.color == perspective else 1
-        combined_type = relative_color * 5 + PIECE_INDEX_NO_KING[piece.piece_type]
-        indices.append(king_square * 640 + piece_square * 10 + combined_type)
+    for piece_bb, piece_idx in (
+        (board.pawns, 0),
+        (board.knights, 1),
+        (board.bishops, 2),
+        (board.rooks, 3),
+        (board.queens, 4),
+    ):
+        for color, relative_color in ((perspective, 0), (not perspective, 1)):
+            combined_type = relative_color * 5 + piece_idx
+            for square in chess.scan_reversed(piece_bb & board.occupied_co[color]):
+                piece_square = _orient(square, perspective)
+                indices.append(king_square * 640 + piece_square * 10 + combined_type)
     indices.extend(castling_indices(board, perspective))
     return indices
 
@@ -187,28 +198,87 @@ def _int8_matvec(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
     return out
 
 
+# The rest of evaluate_head, also jitted: it's a chain of small numpy calls (np.maximum, np.round,
+# np.minimum, a .max() reduction, two small float32 matmuls) each carrying its own Python-level
+# dispatch overhead — real cost for arrays this small (512 down to 32 elements), the same lesson as
+# the piece_map()-vs-popcount fix elsewhere in this file. One scalar-loop pass replaces the whole
+# chain with none of that per-call overhead.
+@numba.njit(
+    "float32(int32[:], int8[:,:], float64, float64, float32[:], float32[:,:], float32[:], "
+    "float32[:,:], float32[:])"
+)
+def _evaluate_head_jit(
+    x: np.ndarray,
+    head1_weight: np.ndarray,
+    ft_scale: float,
+    head1_scale: float,
+    head1_bias: np.ndarray,
+    head3_weight: np.ndarray,
+    head3_bias: np.ndarray,
+    head5_weight: np.ndarray,
+    head5_bias: np.ndarray,
+) -> np.float32:
+    n = x.shape[0]
+    act_max = 1
+    for i in range(n):
+        v = x[i]
+        if v > act_max:
+            act_max = v
+    # float64 division, matching the original's `act_max / 127.0` (a Python int / float) exactly —
+    # only the *combined* scale below gets truncated to float32, same as the original does.
+    act_scale = act_max / 127.0
+
+    x_i8 = np.empty(n, dtype=np.int8)
+    for i in range(n):
+        v = x[i]
+        if v < 0:
+            v = 0
+        q = round(v / act_scale)  # float64 round-half-to-even, same as np.round on relu_x/act_scale
+        if q > 127:
+            q = 127
+        x_i8[i] = np.int8(q)
+
+    out_features, in_features = head1_weight.shape
+    combined_scale = np.float32(act_scale * ft_scale * head1_scale)
+    h1 = np.empty(out_features, dtype=np.float32)
+    for i in range(out_features):
+        acc = np.int32(0)
+        for j in range(in_features):
+            acc += np.int32(x_i8[j]) * np.int32(head1_weight[i, j])
+        v2 = np.float32(acc) * combined_scale + head1_bias[i]
+        h1[i] = v2 if v2 > 0.0 else np.float32(0.0)
+
+    h2_out, h2_in = head3_weight.shape
+    h2 = np.empty(h2_out, dtype=np.float32)
+    for i in range(h2_out):
+        acc2 = np.float32(0.0)
+        for j in range(h2_in):
+            acc2 += h1[j] * head3_weight[i, j]
+        v3 = acc2 + head3_bias[i]
+        h2[i] = v3 if v3 > 0.0 else np.float32(0.0)
+
+    result = np.float32(0.0)
+    for j in range(head5_weight.shape[1]):
+        result += h2[j] * head5_weight[0, j]
+    result += head5_bias[0]
+    return np.float32(result)
+
+
 def evaluate_head(x: np.ndarray, weights: NNUEWeights) -> float:
     """x: the concatenated (stm, nstm) accumulator, int32, shape (ACCUMULATOR_DIM * 2,)."""
-    relu_x = np.maximum(x, 0)
-
-    # Requantize the int32 accumulator down to int8 for the matvec. There's no fixed activation
-    # range to calibrate against, so the scale is derived per call from the actual max — cheap
-    # (one reduction over 512 ints) and exact for whatever range this position's activations
-    # happen to occupy.
-    act_max = max(int(relu_x.max()), 1)
-    act_scale = act_max / 127.0
-    x_i8 = np.minimum(np.round(relu_x / act_scale), 127).astype(np.int8)
-
-    h1_i32 = _int8_matvec(x_i8, weights.head1_weight)
-    combined_scale = np.float32(act_scale * weights.ft_scale * weights.head1_scale)
-    h1 = h1_i32.astype(np.float32) * combined_scale + weights.head1_bias
-    h1 = np.maximum(h1, 0.0)
-
-    h2 = h1 @ weights.head3_weight.T + weights.head3_bias
-    h2 = np.maximum(h2, 0.0)
-
-    out = h2 @ weights.head5_weight.T + weights.head5_bias
-    return float(out[0])
+    return float(
+        _evaluate_head_jit(
+            x,
+            weights.head1_weight,
+            weights.ft_scale,
+            weights.head1_scale,
+            weights.head1_bias,
+            weights.head3_weight,
+            weights.head3_bias,
+            weights.head5_weight,
+            weights.head5_bias,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +397,18 @@ class Accumulator:
         self.weight = weight  # int16
         self.white_acc = np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
         self.black_acc = np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
-        self._stack: list[tuple[np.ndarray, np.ndarray]] = []
+        self._stack: list[tuple[np.ndarray, np.ndarray, bool]] = []
+        # Latches True once neither side has any castling right left — a one-way state in a real
+        # game (rights are never regained), but search pushes and pops constantly across branches,
+        # so this has to travel with the push/pop stack like the accumulators do, not live as a
+        # bare instance flag: popping back above the point where rights ran out must see them as
+        # available again for whatever sibling branch gets explored next.
+        self._castling_exhausted = False
 
     def set_position(self, board: chess.Board) -> None:
         self.white_acc = self._full(board, chess.WHITE)
         self.black_acc = self._full(board, chess.BLACK)
+        self._castling_exhausted = not any(_castling_rights(board))
         self._stack.clear()
 
     def _full(self, board: chess.Board, perspective: bool) -> np.ndarray:
@@ -349,13 +426,16 @@ class Accumulator:
         return np.concatenate([stm, nstm])
 
     def push(self, board: chess.Board, move: chess.Move) -> None:
-        self._stack.append((self.white_acc.copy(), self.black_acc.copy()))
+        self._stack.append((self.white_acc.copy(), self.black_acc.copy(), self._castling_exhausted))
         if move == chess.Move.null():
             board.push(move)
             return
 
         updates, king_moved_color = move_updates(board, move)
-        rights_before = _castling_rights(board)
+        # Once neither side has a right left, no move can ever change that — skip both the
+        # before/after snapshots and the diff entirely instead of confirming the same "nothing to
+        # lose" answer on every remaining push down this branch.
+        rights_before = None if self._castling_exhausted else _castling_rights(board)
         for perspective, acc in ((chess.WHITE, self.white_acc), (chess.BLACK, self.black_acc)):
             if perspective == king_moved_color:
                 continue
@@ -365,15 +445,19 @@ class Accumulator:
 
         board.push(move)
 
-        lost_rights = _lost_castling_rights(rights_before, _castling_rights(board))
-        if lost_rights:
-            for perspective, acc in (
-                (chess.WHITE, self.white_acc),
-                (chess.BLACK, self.black_acc),
-            ):
-                if perspective == king_moved_color:
-                    continue  # gets a full refresh below, which reflects the new rights anyway
-                _apply_castling_losses(acc, self.weight, perspective, lost_rights)
+        if rights_before is not None:
+            rights_after = _castling_rights(board)
+            if not any(rights_after):
+                self._castling_exhausted = True
+            lost_rights = _lost_castling_rights(rights_before, rights_after)
+            if lost_rights:
+                for perspective, acc in (
+                    (chess.WHITE, self.white_acc),
+                    (chess.BLACK, self.black_acc),
+                ):
+                    if perspective == king_moved_color:
+                        continue  # gets a full refresh below, reflecting the new rights anyway
+                    _apply_castling_losses(acc, self.weight, perspective, lost_rights)
 
         if king_moved_color == chess.WHITE:
             self.white_acc = self._full(board, chess.WHITE)
@@ -382,7 +466,7 @@ class Accumulator:
 
     def pop(self, board: chess.Board) -> None:
         board.pop()
-        self.white_acc, self.black_acc = self._stack.pop()
+        self.white_acc, self.black_acc, self._castling_exhausted = self._stack.pop()
 
 
 _ACC = Accumulator(_WEIGHTS.ft_weight)
