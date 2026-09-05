@@ -260,11 +260,19 @@ def phase_tag(board: chess.Board) -> float:
     return material / STARTING_NON_PAWN_MATERIAL
 
 
-def fetch(num_positions: int, sample_every: int, data_dir: Path = DATA_DIR) -> None:
+def fetch(
+    num_positions: int,
+    sample_every: int,
+    data_dir: Path = DATA_DIR,
+    score_cp_limit: float = SCORE_CP_LIMIT,
+) -> None:
     """Streams the eval dump, keeping one position every `sample_every` lines seen, until
     `num_positions` positions have been kept. sample_every=1 takes a prefix of the file, which is
     fast but whatever ordering Lichess wrote the dump in; a larger value spreads the sample over
-    more of the file at the cost of reading (and discarding) more of the stream."""
+    more of the file at the cost of reading (and discarding) more of the stream.
+
+    `score_cp_limit` gates the sharp/near-decisive-position drop (module default SCORE_CP_LIMIT);
+    pass float("inf") to keep every position regardless of raw score magnitude."""
     data_dir.mkdir(exist_ok=True)
     stm_path = data_dir / "stm_indices.i32"
     nstm_path = data_dir / "nstm_indices.i32"
@@ -319,7 +327,7 @@ def fetch(num_positions: int, sample_every: int, data_dir: Path = DATA_DIR) -> N
                 pv = pvs[0]
 
                 raw_cp = _raw_cp(pv)
-                if raw_cp is None or abs(raw_cp) > SCORE_CP_LIMIT:
+                if raw_cp is None or abs(raw_cp) > score_cp_limit:
                     dropped["score_magnitude"] += 1
                     continue
 
@@ -516,6 +524,13 @@ def main() -> None:
         default=DATA_DIR,
         help="where to write the dataset (default mlp/data_v2/) -- never overwrites mlp/data/",
     )
+    fetch_parser.add_argument(
+        "--score-cp-limit",
+        type=float,
+        default=SCORE_CP_LIMIT,
+        help="drop positions with |raw cp| above this, before clipping (default 800); "
+        "pass inf to keep sharp/near-decisive positions too",
+    )
 
     fit_parser = subparsers.add_parser("fit")
     fit_parser.add_argument("--epochs", type=int, default=20)
@@ -535,7 +550,12 @@ def main() -> None:
 
     arguments = parser.parse_args()
     if arguments.command == "fetch":
-        fetch(arguments.positions, arguments.sample_every, arguments.data_dir)
+        fetch(
+            arguments.positions,
+            arguments.sample_every,
+            arguments.data_dir,
+            arguments.score_cp_limit,
+        )
     else:
         fit(
             arguments.epochs,
