@@ -22,27 +22,45 @@ this is the float32 architecture stage, quantization and the incrementally-updat
 that make it fast enough to search with are separate follow-on work.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import multiprocessing
+import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import chess
 import numpy as np
-import torch
-from torch import nn
+
+# torch takes ~1.7s to import -- dead weight fetch() doesn't need, and multiprocessing.Pool below
+# re-imports this whole module in every worker process, so a module-level `import torch` would pay
+# that cost N times just to spawn the pool. Deferred into fit()/_resolve_device()/_wdl_loss(), the
+# only places that actually touch it; `from __future__ import annotations` (above) keeps the
+# torch.Tensor type hints in their signatures valid without torch imported at module scope.
+if TYPE_CHECKING:
+    import torch
 
 DATA_DIR = Path(__file__).parent / "data_v2"
 WEIGHTS_PATH = Path(__file__).parent / "weights.pt"
 
 EVAL_URL = "https://database.lichess.org/lichess_db_eval.jsonl.zst"
-TARGET_CLIP_CP = 1000.0
+# Finite (non-mate) scores clip here -- high enough that a real massive-material-advantage position
+# survives intact for the WDL sigmoid below to compress, rather than getting flattened to the same
+# value as a merely-comfortable one. Mate scores don't use this: see MATE_TARGET_CP.
+TARGET_CLIP_CP = 1500.0
+MATE_TARGET_CP = 3000.0  # static target for a mate-in-N line -- more decisive than any finite score
 MIN_DEPTH = 16
 WDL_SCALE_CP = 400.0  # centipawns that map to a 1-sigma shift in sigmoid win-probability space
-SCORE_CP_LIMIT = 800.0  # drop positions this sharp/near-decisive, raw score, before any clipping
 DEPTH_GAP_CP_LIMIT = 50.0  # max disagreement between a shallow(>=MIN_DEPTH) and the deepest pass
+# No opening-ply truncation: the dump's FEN strings never carry a real fullmove number (_pad_fen
+# below hardcodes one on every row that's missing it, which is effectively all of them), so there's
+# no ply-position signal in this dataset to filter an "opening truncation" on.
 
 # ---------------------------------------------------------------------------
 # HalfKP feature encoding: the thing that makes this NNUE rather than a plain
@@ -122,26 +140,8 @@ def _padded(indices: list[int]) -> np.ndarray:
 
 ACCUMULATOR_DIM = 256
 
-
-class NNUE(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.feature_transformer = nn.EmbeddingBag(
-            FEATURE_DIM + 1, ACCUMULATOR_DIM, mode="sum", padding_idx=PAD_INDEX
-        )
-        self.head = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(ACCUMULATOR_DIM * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-
-    def forward(self, stm_indices: torch.Tensor, nstm_indices: torch.Tensor) -> torch.Tensor:
-        stm_acc = self.feature_transformer(stm_indices)
-        nstm_acc = self.feature_transformer(nstm_indices)
-        return self.head(torch.cat([stm_acc, nstm_acc], dim=1))
+# NNUE is defined inside fit() (below), not here, alongside its own `import torch` — see the note
+# on the deferred torch import up top for why.
 
 
 # ---------------------------------------------------------------------------
@@ -169,24 +169,24 @@ def _target_cp(entry: dict, stm_is_white: bool) -> float | None:
         return None
     pv = pvs[0]
     if "mate" in pv:
-        cp = TARGET_CLIP_CP if pv["mate"] > 0 else -TARGET_CLIP_CP
+        cp = MATE_TARGET_CP if pv["mate"] > 0 else -MATE_TARGET_CP
     elif "cp" in pv:
-        cp = float(pv["cp"])
+        cp = max(-TARGET_CLIP_CP, min(TARGET_CLIP_CP, float(pv["cp"])))
     else:
         return None
-    cp = max(-TARGET_CLIP_CP, min(TARGET_CLIP_CP, cp))
     return cp if stm_is_white else -cp
 
 
 def _is_quiet(board: chess.Board, pv: dict) -> bool:
-    """A static evaluator can't see the tactics a search would find, so positions where the side to
-    move is already in check, or the engine's own top line is a capture/promotion/check, carry a
-    target the net has no way to predict from the position alone — drop them rather than train on
-    that noise. Deliberately not stricter than this (e.g. requiring no capture anywhere on the
-    board): that would strip out most complex middlegames and bias the dataset toward bland,
-    quiet-by-construction positions."""
-    if board.is_check():
-        return False
+    """A static evaluator can't see a trade in progress the way a search would, so a position whose
+    engine's own top line is a capture or promotion carries a target the net has no way to predict
+    from the position alone — drop it rather than train on that noise. A position where the side to
+    move is already in check is kept rather than dropped: that's the only source of "king under
+    attack" signal in the whole dataset (see king_safety_score in agent.py, which has nothing else
+    to learn from). Deliberately not stricter than the capture/promotion check (e.g. requiring no
+    capture anywhere on the board, or dropping a move that itself gives check): that would strip out
+    most complex middlegames and most of the check-in-check-out sequences this filter exists to
+    keep, biasing the dataset toward bland, quiet-by-construction positions."""
     line = pv.get("line")
     if not line:
         return True
@@ -200,16 +200,7 @@ def _is_quiet(board: chess.Board, pv: dict) -> bool:
         move = board.parse_uci(line.split()[0])
     except ValueError:
         return True
-    return not (board.is_capture(move) or move.promotion or board.gives_check(move))
-
-
-def _raw_cp(pv: dict) -> float | None:
-    """The PV's raw score, unclipped — None for a mate line (unbounded magnitude, the single most
-    decisive category there is, so it fails any cp-magnitude filter by construction)."""
-    if "mate" in pv:
-        return None
-    cp = pv.get("cp")
-    return float(cp) if cp is not None else None
+    return not (board.is_capture(move) or move.promotion)
 
 
 def _depth_disagreement(evals: list[dict], deepest: dict, min_depth: int) -> float | None:
@@ -260,19 +251,68 @@ def phase_tag(board: chess.Board) -> float:
     return material / STARTING_NON_PAWN_MATERIAL
 
 
+_Row = tuple[np.ndarray, np.ndarray, np.float32, np.float32]  # stm, nstm, target, phase
+_ProcessResult = tuple[str, None] | tuple[None, _Row]
+
+
+def _process_line(raw_line: bytes) -> _ProcessResult:
+    """The CPU-bound part of turning one dump line into a training row, run in a worker process
+    (see fetch()'s multiprocessing.Pool below). Measured directly: chess.Board construction and
+    the two halfkp_indices calls are ~80% of this pipeline's per-line cost, and curl+zstd alone can
+    supply lines about 4x faster than one core can process them -- spreading this across cores is
+    most of the win. Returns (drop_reason, None) for a rejected line, or (None, (stm, nstm, target,
+    phase)) -- both padded/typed exactly as fetch() used to write them, so the caller just appends
+    bytes without knowing anything happened in another process."""
+    try:
+        row = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return "json_error", None
+
+    evals = row.get("evals", [])
+    entry = _best_eval(evals)
+    if entry is None or entry.get("depth", 0) < MIN_DEPTH:
+        return "depth", None
+
+    pvs = entry.get("pvs")
+    if not pvs:
+        return "depth", None
+    pv = pvs[0]
+
+    gap = _depth_disagreement(evals, entry, MIN_DEPTH)
+    if gap is not None and gap > DEPTH_GAP_CP_LIMIT:
+        return "depth_disagreement", None
+
+    board = chess.Board(_pad_fen(row["fen"]))
+    if not _is_quiet(board, pv):
+        return "not_quiet", None
+
+    target = _target_cp(entry, board.turn == chess.WHITE)
+    if target is None:
+        return "no_target", None
+
+    # The eval dump includes board-editor setups, not just game positions, so piece counts can
+    # exceed what's reachable in a legal game (e.g. six queens). Skip those.
+    stm = halfkp_indices(board, board.turn)
+    nstm = halfkp_indices(board, not board.turn)
+    if len(stm) > MAX_ACTIVE or len(nstm) > MAX_ACTIVE:
+        return "too_many_pieces", None
+
+    return None, (_padded(stm), _padded(nstm), np.float32(target), np.float32(phase_tag(board)))
+
+
 def fetch(
     num_positions: int,
     sample_every: int,
     data_dir: Path = DATA_DIR,
-    score_cp_limit: float = SCORE_CP_LIMIT,
 ) -> None:
     """Streams the eval dump, keeping one position every `sample_every` lines seen, until
     `num_positions` positions have been kept. sample_every=1 takes a prefix of the file, which is
     fast but whatever ordering Lichess wrote the dump in; a larger value spreads the sample over
     more of the file at the cost of reading (and discarding) more of the stream.
 
-    `score_cp_limit` gates the sharp/near-decisive-position drop (module default SCORE_CP_LIMIT);
-    pass float("inf") to keep every position regardless of raw score magnitude."""
+    The per-line filtering/encoding (_process_line) runs in a multiprocessing.Pool -- one process
+    alone leaves most of a modern machine idle here, since network + decompression can feed lines
+    several times faster than a single core can turn them into training rows."""
     data_dir.mkdir(exist_ok=True)
     stm_path = data_dir / "stm_indices.i32"
     nstm_path = data_dir / "nstm_indices.i32"
@@ -284,84 +324,52 @@ def fetch(
     zstd = subprocess.Popen(["zstd", "-dc"], stdin=curl.stdout, stdout=subprocess.PIPE)
     assert curl.stdout is not None
     curl.stdout.close()
+    zstd_stdout = zstd.stdout
+    assert zstd_stdout is not None
 
     kept = 0
-    seen = 0
-    # Cheapest filters first (pure dict access, no Board needed) so an expensive board construction
-    # + move parse only happens for candidates that already cleared the free checks.
+    seen = [0]  # mutable cell: sampled_lines() below runs in this process, not a worker
     dropped = {
+        "json_error": 0,
         "depth": 0,
-        "score_magnitude": 0,
         "depth_disagreement": 0,
         "not_quiet": 0,
         "no_target": 0,
         "too_many_pieces": 0,
     }
+
+    def sampled_lines() -> Iterator[bytes]:
+        for raw_line in zstd_stdout:
+            seen[0] += 1
+            if seen[0] % sample_every == 0:
+                yield raw_line
+
+    workers = max(1, (os.cpu_count() or 2) - 1)  # leave a core for curl/zstd/this process
     try:
         with (
             open(stm_path, "wb") as stm_out,
             open(nstm_path, "wb") as nstm_out,
             open(targets_path, "wb") as target_out,
             open(phase_path, "wb") as phase_out,
+            multiprocessing.Pool(processes=workers) as pool,
         ):
-            assert zstd.stdout is not None
-            for raw_line in zstd.stdout:
-                seen += 1
-                if seen % sample_every != 0:
-                    continue
-                try:
-                    row = json.loads(raw_line)
-                except json.JSONDecodeError:
+            for drop_reason, result in pool.imap_unordered(
+                _process_line, sampled_lines(), chunksize=64
+            ):
+                if result is None:
+                    assert drop_reason is not None
+                    dropped[drop_reason] += 1
                     continue
 
-                evals = row.get("evals", [])
-                entry = _best_eval(evals)
-                if entry is None or entry.get("depth", 0) < MIN_DEPTH:
-                    dropped["depth"] += 1
-                    continue
-
-                pvs = entry.get("pvs")
-                if not pvs:
-                    dropped["depth"] += 1
-                    continue
-                pv = pvs[0]
-
-                raw_cp = _raw_cp(pv)
-                if raw_cp is None or abs(raw_cp) > score_cp_limit:
-                    dropped["score_magnitude"] += 1
-                    continue
-
-                gap = _depth_disagreement(evals, entry, MIN_DEPTH)
-                if gap is not None and gap > DEPTH_GAP_CP_LIMIT:
-                    dropped["depth_disagreement"] += 1
-                    continue
-
-                board = chess.Board(_pad_fen(row["fen"]))
-                if not _is_quiet(board, pv):
-                    dropped["not_quiet"] += 1
-                    continue
-
-                target = _target_cp(entry, board.turn == chess.WHITE)
-                if target is None:
-                    dropped["no_target"] += 1
-                    continue
-
-                # The eval dump includes board-editor setups, not just game positions, so piece
-                # counts can exceed what's reachable in a legal game (e.g. six queens). Skip those.
-                stm = halfkp_indices(board, board.turn)
-                nstm = halfkp_indices(board, not board.turn)
-                if len(stm) > MAX_ACTIVE or len(nstm) > MAX_ACTIVE:
-                    dropped["too_many_pieces"] += 1
-                    continue
-
-                stm_out.write(_padded(stm).tobytes())
-                nstm_out.write(_padded(nstm).tobytes())
-                target_out.write(np.float32(target).tobytes())
-                phase_out.write(np.float32(phase_tag(board)).tobytes())
+                stm_arr, nstm_arr, target, phase = result
+                stm_out.write(stm_arr.tobytes())
+                nstm_out.write(nstm_arr.tobytes())
+                target_out.write(target.tobytes())
+                phase_out.write(phase.tobytes())
 
                 kept += 1
                 if kept % 50000 == 0:
-                    print(f"kept {kept} / seen {seen}", file=sys.stderr)
+                    print(f"kept {kept} / seen {seen[0]}", file=sys.stderr)
                 if kept >= num_positions:
                     break
     finally:
@@ -369,7 +377,7 @@ def fetch(
         curl.kill()
 
     np.save(count_path, np.array([kept], dtype=np.int64))
-    print(f"done: kept {kept} positions from {seen} lines seen", file=sys.stderr)
+    print(f"done: kept {kept} positions from {seen[0]} lines seen", file=sys.stderr)
     print(f"dropped by filter: {dropped}", file=sys.stderr)
 
 
@@ -389,6 +397,8 @@ def _progress_bar(current: int, total: int, prefix: str) -> None:
 def _resolve_device(requested: str) -> str:
     if requested != "auto":
         return requested
+    import torch
+
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -396,14 +406,47 @@ def _resolve_device(requested: str) -> str:
     return "cpu"
 
 
-def _wdl_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _wdl_loss(
+    pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor | None = None
+) -> torch.Tensor:
     """Cross-entropy between predicted and target win probability (sigmoid(cp / WDL_SCALE_CP)),
     the standard NNUE training loss — a 900-vs-1000cp miss (both already "winning") counts for far
     less than a 0-vs-100cp miss (drawish vs winning), and BCE's gradient stays strong even when a
-    prediction is confidently wrong, unlike MSE's which vanishes as the sigmoid saturates."""
+    prediction is confidently wrong, unlike MSE's which vanishes as the sigmoid saturates.
+
+    `weight` (see _target_density_weights) is for a --reweight fine-tuning pass; leave it None for
+    a from-scratch run and always for validation, where the point is reading the model's true,
+    unweighted calibration back out."""
+    import torch
+    from torch import nn
+
     return nn.functional.binary_cross_entropy_with_logits(
-        pred / WDL_SCALE_CP, torch.sigmoid(target / WDL_SCALE_CP)
+        pred / WDL_SCALE_CP, torch.sigmoid(target / WDL_SCALE_CP), weight=weight
     )
+
+
+def _target_density_weights(targets: np.ndarray, num_bins: int = 60) -> np.ndarray:
+    """Per-example training weight, inverse to how densely populated its |target| bin is.
+
+    Meant for a `fit --reweight` fine-tuning pass on top of an already-trained model, not a
+    from-scratch run: real game positions are heavily clustered near dead-equal (data_v3, e.g., was
+    ~28% within 25cp of equal and thinned out fast from there, only ~12.6% in the 100-200cp band),
+    and a single shared regression function fit against that skew learns to hedge every prediction
+    toward zero to minimize loss on the dominant near-equal mass -- measured directly on data_v3, a
+    real ~100-150cp edge came out of the trained model as only ~65-100cp. Weighting examples back
+    toward a uniform density over |target| counteracts that.
+
+    sqrt of inverse density, not the full inverse: a bin at 1% of the average density gets ~10x the
+    weight, not 100x, so the rarest bins (mate scores, huge material swings) don't end up
+    dominating gradient steps just for being rare -- this corrects the near-zero pileup, it doesn't
+    demand every band contribute equally regardless of how little signal it carries."""
+    magnitude = np.abs(targets).astype(np.float32)
+    bin_edges = np.linspace(0.0, float(magnitude.max()) + 1.0, num_bins + 1, dtype=np.float32)
+    bin_index = np.clip(np.digitize(magnitude, bin_edges) - 1, 0, num_bins - 1)
+    counts = np.bincount(bin_index, minlength=num_bins).astype(np.float32)
+    density = counts[bin_index] / len(magnitude)
+    weight = 1.0 / np.sqrt(density * num_bins)
+    return (weight / weight.mean()).astype(np.float32)  # mean 1 -- comparable loss/lr scale
 
 
 def fit(
@@ -414,7 +457,32 @@ def fit(
     device: str,
     output: str | None,
     data_dir: Path = DATA_DIR,
+    init_weights: Path | None = None,
+    reweight: bool = False,
 ) -> None:
+    import torch
+    from torch import nn
+
+    class NNUE(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.feature_transformer = nn.EmbeddingBag(
+                FEATURE_DIM + 1, ACCUMULATOR_DIM, mode="sum", padding_idx=PAD_INDEX
+            )
+            self.head = nn.Sequential(
+                nn.ReLU(),
+                nn.Linear(ACCUMULATOR_DIM * 2, 32),
+                nn.ReLU(),
+                nn.Linear(32, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+            )
+
+        def forward(self, stm_indices: torch.Tensor, nstm_indices: torch.Tensor) -> torch.Tensor:
+            stm_acc = self.feature_transformer(stm_indices)
+            nstm_acc = self.feature_transformer(nstm_indices)
+            return self.head(torch.cat([stm_acc, nstm_acc], dim=1))
+
     count = int(np.load(data_dir / "count.npy")[0])
     stm_indices = np.memmap(
         data_dir / "stm_indices.i32", dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE)
@@ -440,9 +508,14 @@ def fit(
 
     torch.manual_seed(0)
     model = NNUE().to(resolved_device)
+    if init_weights is not None:
+        model.load_state_dict(torch.load(init_weights, map_location=resolved_device))
+        print(f"fine-tuning from {init_weights}", file=sys.stderr)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     train_batches = -(-len(train_idx) // batch_size)  # ceil division
+
+    sample_weight = _target_density_weights(targets) if reweight else None
 
     # idx is sorted into file order, so a block is a contiguous (~520MB at block_rows=2M) memmap
     # region — small enough to stay resident in page cache even on a memory-tight machine. Only
@@ -463,15 +536,18 @@ def fit(
             stm = torch.from_numpy(stm_indices[batch].astype(np.int64)).to(resolved_device)
             nstm = torch.from_numpy(nstm_indices[batch].astype(np.int64)).to(resolved_device)
             y = torch.from_numpy(targets[batch].astype(np.float32)).unsqueeze(1).to(resolved_device)
-            yield stm, nstm, y
+            w = None
+            if sample_weight is not None:
+                w = torch.from_numpy(sample_weight[batch]).unsqueeze(1).to(resolved_device)
+            yield stm, nstm, y, w
 
     for epoch in range(epochs):
         model.train()
         train_loss, train_cp_err, n = 0.0, 0.0, 0
-        for step, (stm, nstm, y) in enumerate(batches(train_idx, shuffle=True), start=1):
+        for step, (stm, nstm, y, w) in enumerate(batches(train_idx, shuffle=True), start=1):
             optimizer.zero_grad()
             pred = model(stm, nstm)
-            loss = _wdl_loss(pred, y)
+            loss = _wdl_loss(pred, y, weight=w)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(y)
@@ -488,7 +564,7 @@ def fit(
         model.eval()
         val_loss, val_cp_err, vn = 0.0, 0.0, 0
         with torch.no_grad():
-            for stm, nstm, y in batches(val_idx, shuffle=False):
+            for stm, nstm, y, _ in batches(val_idx, shuffle=False):
                 pred = model(stm, nstm)
                 val_loss += _wdl_loss(pred, y).item() * len(y)
                 val_cp_err += (pred - y).abs().sum().item()
@@ -524,13 +600,6 @@ def main() -> None:
         default=DATA_DIR,
         help="where to write the dataset (default mlp/data_v2/) -- never overwrites mlp/data/",
     )
-    fetch_parser.add_argument(
-        "--score-cp-limit",
-        type=float,
-        default=SCORE_CP_LIMIT,
-        help="drop positions with |raw cp| above this, before clipping (default 800); "
-        "pass inf to keep sharp/near-decisive positions too",
-    )
 
     fit_parser = subparsers.add_parser("fit")
     fit_parser.add_argument("--epochs", type=int, default=20)
@@ -547,15 +616,24 @@ def main() -> None:
     fit_parser.add_argument(
         "--data-dir", type=Path, default=DATA_DIR, help="dataset to train on (default mlp/data_v2/)"
     )
+    fit_parser.add_argument(
+        "--init-weights",
+        type=Path,
+        default=None,
+        help="load this checkpoint instead of random-initializing -- for fine-tuning an existing "
+        "model rather than training from scratch",
+    )
+    fit_parser.add_argument(
+        "--reweight",
+        action="store_true",
+        help="weight training examples inversely to |target| density (see "
+        "_target_density_weights) -- for a fine-tuning pass correcting calibration in an "
+        "underrepresented cp range; not intended for a from-scratch run",
+    )
 
     arguments = parser.parse_args()
     if arguments.command == "fetch":
-        fetch(
-            arguments.positions,
-            arguments.sample_every,
-            arguments.data_dir,
-            arguments.score_cp_limit,
-        )
+        fetch(arguments.positions, arguments.sample_every, arguments.data_dir)
     else:
         fit(
             arguments.epochs,
@@ -565,6 +643,8 @@ def main() -> None:
             arguments.device,
             arguments.output,
             arguments.data_dir,
+            arguments.init_weights,
+            arguments.reweight,
         )
 
 

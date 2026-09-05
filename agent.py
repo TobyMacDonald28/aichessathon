@@ -175,20 +175,26 @@ _WEIGHTS = load_weights()
 # ---------------------------------------------------------------------------
 
 
-@numba.njit("int32[:](int8[:], int8[:,:])")
-def _int8_matvec(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
-    out_features, in_features = weight.shape
-    out = np.zeros(out_features, dtype=np.int32)
-    for i in range(out_features):
-        acc = np.int32(0)
-        for j in range(in_features):
-            acc += np.int32(x[j]) * np.int32(weight[i, j])
-        out[i] = acc
-    return out
-
-
-def evaluate_head(x: np.ndarray, weights: NNUEWeights) -> float:
-    """x: the concatenated (stm, nstm) accumulator, int32, shape (ACCUMULATOR_DIM * 2,)."""
+@numba.njit(
+    "float64(int32[:], int8[:,:], float64, float64, float32[:], float32[:,:], float32[:], "
+    "float32[:,:], float32[:])"
+)
+def _evaluate_head_jit(
+    x: np.ndarray,
+    head1_weight: np.ndarray,
+    ft_scale: float,
+    head1_scale: float,
+    head1_bias: np.ndarray,
+    head3_weight: np.ndarray,
+    head3_bias: np.ndarray,
+    head5_weight: np.ndarray,
+    head5_bias: np.ndarray,
+) -> float:
+    """The whole head fused into one compiled call, not just the big matvec: the requantization
+    and the two small (32x32, 32x1) matmuls around it were plain numpy on 512-or-fewer-element
+    arrays, where numpy's per-call dispatch and temporary-array allocation cost more than the
+    arithmetic itself. One compiled function with explicit loops throughout pays that dispatch
+    cost once (at import, via the eager signature below) instead of ~5 times per evaluate() call."""
     relu_x = np.maximum(x, 0)
 
     # Requantize the int32 accumulator down to int8 for the matvec. There's no fixed activation
@@ -199,16 +205,44 @@ def evaluate_head(x: np.ndarray, weights: NNUEWeights) -> float:
     act_scale = act_max / 127.0
     x_i8 = np.minimum(np.round(relu_x / act_scale), 127).astype(np.int8)
 
-    h1_i32 = _int8_matvec(x_i8, weights.head1_weight)
-    combined_scale = np.float32(act_scale * weights.ft_scale * weights.head1_scale)
-    h1 = h1_i32.astype(np.float32) * combined_scale + weights.head1_bias
-    h1 = np.maximum(h1, 0.0)
+    out_features, in_features = head1_weight.shape
+    combined_scale = act_scale * ft_scale * head1_scale
+    h1 = np.empty(out_features, dtype=np.float64)
+    for i in range(out_features):
+        acc = np.int32(0)
+        for j in range(in_features):
+            acc += np.int32(x_i8[j]) * np.int32(head1_weight[i, j])
+        v = acc * combined_scale + head1_bias[i]
+        h1[i] = v if v > 0.0 else 0.0
 
-    h2 = h1 @ weights.head3_weight.T + weights.head3_bias
-    h2 = np.maximum(h2, 0.0)
+    h1_dim, h2_dim = head3_weight.shape
+    h2 = np.empty(h1_dim, dtype=np.float64)
+    for i in range(h1_dim):
+        acc2 = 0.0
+        for j in range(h2_dim):
+            acc2 += h1[j] * head3_weight[i, j]
+        v = acc2 + head3_bias[i]
+        h2[i] = v if v > 0.0 else 0.0
 
-    out = h2 @ weights.head5_weight.T + weights.head5_bias
-    return float(out[0])
+    out = 0.0
+    for j in range(head5_weight.shape[1]):
+        out += h2[j] * head5_weight[0, j]
+    return float(out + head5_bias[0])
+
+
+def evaluate_head(x: np.ndarray, weights: NNUEWeights) -> float:
+    """x: the concatenated (stm, nstm) accumulator, int32, shape (ACCUMULATOR_DIM * 2,)."""
+    return _evaluate_head_jit(
+        x,
+        weights.head1_weight,
+        weights.ft_scale,
+        weights.head1_scale,
+        weights.head1_bias,
+        weights.head3_weight,
+        weights.head3_bias,
+        weights.head5_weight,
+        weights.head5_bias,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -482,65 +516,6 @@ def tt_slot_index(key: Hashable) -> tuple[int, int]:
     return sig % TT_SIZE, sig
 
 
-# King safety: the NNUE score alone rarely penalizes an exposed king (see king_safety_score's
-# docstring) since it's a purely learned signal, and train.py's _is_quiet filter drops exactly the
-# in-check and tactical positions that would otherwise teach it. This is a small explicit
-# correction layered on top, the standard "open file near the king" heuristic, scaled down as the
-# opponent's attacking material comes off the board — an open file next to the king is a threat in
-# proportion to what's left to use it, not a flat penalty that lingers into a bare-king endgame.
-OPEN_FILE_KING_PENALTY = 18.0  # semi-open: no pawn of the king's own color on this file
-FULLY_OPEN_FILE_KING_PENALTY = 32.0  # fully open: neither side has a pawn on this file
-KING_SAFETY_MAX_ATTACKERS = 4.0 + 2.0 * 2.0 + 1.0 * 4.0  # one queen, two rooks, four minors
-
-# A direct incentive to actually castle, rather than just reacting to open files once the king is
-# already somewhere: king_safety_score only judges the current square, so it can't see a
-# prophylactic weakening push (e.g. an early h-pawn lunge) coming, and gives a manual king walk to
-# a nominally-covered square the same credit as really castling there. This flat bonus for sitting
-# on the post-castling square gives the search a reason to prefer castling *earlier* over delaying
-# it, on top of (not instead of) the open-file penalty above.
-CASTLED_KING_BONUS = 40.0
-CASTLED_KING_SQUARES = {
-    chess.WHITE: (chess.G1, chess.C1),
-    chess.BLACK: (chess.G8, chess.C8),
-}
-
-
-def _attacker_weight(board: chess.Board, color: bool) -> float:
-    """How much material `color` has left to attack with, weighted queen > rook > minor. Reads
-    raw bitboards (`pieces_mask` + `int.bit_count`) rather than `board.pieces()` — the latter
-    wraps each result in a `SquareSet` object just to be `len()`'d away again, which dominated
-    this function's cost since evaluate() calls it on every leaf node of the search."""
-    queens = board.pieces_mask(chess.QUEEN, color).bit_count()
-    rooks = board.pieces_mask(chess.ROOK, color).bit_count()
-    minor_mask = board.pieces_mask(chess.BISHOP, color) | board.pieces_mask(chess.KNIGHT, color)
-    minors = minor_mask.bit_count()
-    return 4.0 * queens + 2.0 * rooks + minors
-
-
-def king_term(board: chess.Board, color: bool, opponent_weight: float) -> float:
-    """Net king-safety adjustment (in centipawns) for `color`: an open-file penalty around its
-    king (its own file and the two adjacent ones) plus a flat bonus for sitting on the
-    post-castling square, both scaled by `opponent_weight` — the opponent's attacking material,
-    computed once by the caller and passed in rather than recomputed per color pair."""
-    king = board.king(color)
-    assert king is not None
-    scale = opponent_weight / KING_SAFETY_MAX_ATTACKERS
-    bonus = CASTLED_KING_BONUS if king in CASTLED_KING_SQUARES[color] else 0.0
-
-    king_file = chess.square_file(king)
-    own_pawns = board.pieces_mask(chess.PAWN, color)
-    enemy_pawns = board.pieces_mask(chess.PAWN, not color)
-    penalty = 0.0
-    for file in range(max(0, king_file - 1), min(7, king_file + 1) + 1):
-        file_mask = chess.BB_FILES[file]
-        if own_pawns & file_mask:
-            continue
-        fully_open = not (enemy_pawns & file_mask)
-        penalty += FULLY_OPEN_FILE_KING_PENALTY if fully_open else OPEN_FILE_KING_PENALTY
-
-    return (bonus - penalty) * scale
-
-
 def evaluate(board: chess.Board) -> float:
     """Score relative to the side to move: positive means the mover is better. Reads whatever
     _ACC's accumulator currently holds — the caller is responsible for keeping it in sync with
@@ -550,13 +525,7 @@ def evaluate(board: chess.Board) -> float:
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0
     x = _ACC.accumulators_for(board.turn)
-    white_weight = _attacker_weight(board, chess.WHITE)
-    black_weight = _attacker_weight(board, chess.BLACK)
-    mover, other = board.turn, not board.turn
-    mover_weight = black_weight if mover else white_weight
-    other_weight = white_weight if mover else black_weight
-    king_adjustment = king_term(board, mover, mover_weight) - king_term(board, other, other_weight)
-    return evaluate_head(x, _WEIGHTS) + king_adjustment
+    return evaluate_head(x, _WEIGHTS)
 
 
 def material_balance(board: chess.Board, perspective: bool) -> float:

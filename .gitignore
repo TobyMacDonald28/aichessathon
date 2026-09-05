@@ -10,5 +10,5 @@ submission.zip
 mlp/data/
 mlp/data_v2/
 mlp/data_v3/
-mlp/weights*.pt
+mlp/data_v4/
 mlp/weights*.npz
