@@ -482,6 +482,65 @@ def tt_slot_index(key: Hashable) -> tuple[int, int]:
     return sig % TT_SIZE, sig
 
 
+# King safety: the NNUE score alone rarely penalizes an exposed king (see king_safety_score's
+# docstring) since it's a purely learned signal, and train.py's _is_quiet filter drops exactly the
+# in-check and tactical positions that would otherwise teach it. This is a small explicit
+# correction layered on top, the standard "open file near the king" heuristic, scaled down as the
+# opponent's attacking material comes off the board — an open file next to the king is a threat in
+# proportion to what's left to use it, not a flat penalty that lingers into a bare-king endgame.
+OPEN_FILE_KING_PENALTY = 18.0  # semi-open: no pawn of the king's own color on this file
+FULLY_OPEN_FILE_KING_PENALTY = 32.0  # fully open: neither side has a pawn on this file
+KING_SAFETY_MAX_ATTACKERS = 4.0 + 2.0 * 2.0 + 1.0 * 4.0  # one queen, two rooks, four minors
+
+# A direct incentive to actually castle, rather than just reacting to open files once the king is
+# already somewhere: king_safety_score only judges the current square, so it can't see a
+# prophylactic weakening push (e.g. an early h-pawn lunge) coming, and gives a manual king walk to
+# a nominally-covered square the same credit as really castling there. This flat bonus for sitting
+# on the post-castling square gives the search a reason to prefer castling *earlier* over delaying
+# it, on top of (not instead of) the open-file penalty above.
+CASTLED_KING_BONUS = 40.0
+CASTLED_KING_SQUARES = {
+    chess.WHITE: (chess.G1, chess.C1),
+    chess.BLACK: (chess.G8, chess.C8),
+}
+
+
+def _attacker_weight(board: chess.Board, color: bool) -> float:
+    """How much material `color` has left to attack with, weighted queen > rook > minor. Reads
+    raw bitboards (`pieces_mask` + `int.bit_count`) rather than `board.pieces()` — the latter
+    wraps each result in a `SquareSet` object just to be `len()`'d away again, which dominated
+    this function's cost since evaluate() calls it on every leaf node of the search."""
+    queens = board.pieces_mask(chess.QUEEN, color).bit_count()
+    rooks = board.pieces_mask(chess.ROOK, color).bit_count()
+    minor_mask = board.pieces_mask(chess.BISHOP, color) | board.pieces_mask(chess.KNIGHT, color)
+    minors = minor_mask.bit_count()
+    return 4.0 * queens + 2.0 * rooks + minors
+
+
+def king_term(board: chess.Board, color: bool, opponent_weight: float) -> float:
+    """Net king-safety adjustment (in centipawns) for `color`: an open-file penalty around its
+    king (its own file and the two adjacent ones) plus a flat bonus for sitting on the
+    post-castling square, both scaled by `opponent_weight` — the opponent's attacking material,
+    computed once by the caller and passed in rather than recomputed per color pair."""
+    king = board.king(color)
+    assert king is not None
+    scale = opponent_weight / KING_SAFETY_MAX_ATTACKERS
+    bonus = CASTLED_KING_BONUS if king in CASTLED_KING_SQUARES[color] else 0.0
+
+    king_file = chess.square_file(king)
+    own_pawns = board.pieces_mask(chess.PAWN, color)
+    enemy_pawns = board.pieces_mask(chess.PAWN, not color)
+    penalty = 0.0
+    for file in range(max(0, king_file - 1), min(7, king_file + 1) + 1):
+        file_mask = chess.BB_FILES[file]
+        if own_pawns & file_mask:
+            continue
+        fully_open = not (enemy_pawns & file_mask)
+        penalty += FULLY_OPEN_FILE_KING_PENALTY if fully_open else OPEN_FILE_KING_PENALTY
+
+    return (bonus - penalty) * scale
+
+
 def evaluate(board: chess.Board) -> float:
     """Score relative to the side to move: positive means the mover is better. Reads whatever
     _ACC's accumulator currently holds — the caller is responsible for keeping it in sync with
@@ -491,7 +550,13 @@ def evaluate(board: chess.Board) -> float:
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0
     x = _ACC.accumulators_for(board.turn)
-    return evaluate_head(x, _WEIGHTS)
+    white_weight = _attacker_weight(board, chess.WHITE)
+    black_weight = _attacker_weight(board, chess.BLACK)
+    mover, other = board.turn, not board.turn
+    mover_weight = black_weight if mover else white_weight
+    other_weight = white_weight if mover else black_weight
+    king_adjustment = king_term(board, mover, mover_weight) - king_term(board, other, other_weight)
+    return evaluate_head(x, _WEIGHTS) + king_adjustment
 
 
 def material_balance(board: chess.Board, perspective: bool) -> float:
@@ -513,7 +578,7 @@ def contempt_score(board: chess.Board) -> float:
 
 
 OPENING_TAPER_MOVES = 20  # moves over which the opening boost below fades out
-OPENING_START_BUDGET_SEC = 6.0  # target budget at move 1, before any taper
+OPENING_START_BUDGET_SEC = 7.0  # target budget at move 1, before any taper
 
 
 def time_budget_sec(time_left_ms: int, board: chess.Board) -> float:
