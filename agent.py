@@ -8,9 +8,9 @@ being imported from mlp/train.py or mlp/quantize.py (those stay as the training-
 produced weights.npz in the first place).
 """
 
+import random
 import time
 from collections import Counter
-from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -309,9 +309,13 @@ _ACC_DTYPE = np.int32
 def move_updates(board: chess.Board, move: chess.Move) -> tuple[list[Update], bool | None]:
     """Given a move about to be played on `board` (not yet pushed), work out which HalfKP
     (square, piece_type, color) facts appeared or disappeared, and whether either king moved
-    (which forces a full accumulator refresh for that side instead of an incremental update)."""
-    mover = board.piece_at(move.from_square)
-    assert mover is not None
+    (which forces a full accumulator refresh for that side instead of an incremental update).
+    Uses piece_type_at() rather than piece_at() throughout: the mover's color is always board.turn
+    (it's whoever's move this is) and a captured piece is always the other color, so nothing here
+    needs a full Piece object, just the bare piece-type int -- one less allocation per fact."""
+    mover_type = board.piece_type_at(move.from_square)
+    assert mover_type is not None
+    mover_color = board.turn
     updates: list[Update] = []
 
     if board.is_castling(move):
@@ -319,26 +323,24 @@ def move_updates(board: chess.Board, move: chess.Move) -> tuple[list[Update], bo
         rank = chess.square_rank(move.from_square)
         rook_from = chess.square(7 if kingside else 0, rank)
         rook_to = chess.square(5 if kingside else 3, rank)
-        updates.append((rook_from, chess.ROOK, mover.color, -1))
-        updates.append((rook_to, chess.ROOK, mover.color, +1))
-        return updates, mover.color
+        updates.append((rook_from, chess.ROOK, mover_color, -1))
+        updates.append((rook_to, chess.ROOK, mover_color, +1))
+        return updates, mover_color
 
     if board.is_en_passant(move):
-        captured_square = move.to_square + (-8 if mover.color == chess.WHITE else 8)
-        captured = board.piece_at(captured_square)
-        assert captured is not None
-        updates.append((captured_square, captured.piece_type, captured.color, -1))
+        captured_square = move.to_square + (-8 if mover_color == chess.WHITE else 8)
+        updates.append((captured_square, chess.PAWN, not mover_color, -1))
     else:
-        captured = board.piece_at(move.to_square)
-        if captured is not None:
-            updates.append((move.to_square, captured.piece_type, captured.color, -1))
+        captured_type = board.piece_type_at(move.to_square)
+        if captured_type is not None:
+            updates.append((move.to_square, captured_type, not mover_color, -1))
 
-    if mover.piece_type == chess.KING:
-        return updates, mover.color
+    if mover_type == chess.KING:
+        return updates, mover_color
 
-    updates.append((move.from_square, mover.piece_type, mover.color, -1))
-    new_type = move.promotion if move.promotion else mover.piece_type
-    updates.append((move.to_square, new_type, mover.color, +1))
+    updates.append((move.from_square, mover_type, mover_color, -1))
+    new_type = move.promotion if move.promotion else mover_type
+    updates.append((move.to_square, new_type, mover_color, +1))
     return updates, None
 
 
@@ -364,6 +366,7 @@ _CASTLING_LABELS: tuple[tuple[bool, int], ...] = (
     (chess.BLACK, 0),
     (chess.BLACK, 1),
 )
+_CASTLING_LABEL_INDEX = {label: i for i, label in enumerate(_CASTLING_LABELS)}
 
 
 def _castling_rights(board: chess.Board) -> CastlingRights:
@@ -398,6 +401,149 @@ def _apply_castling_losses(
         acc -= weight[PIECE_FEATURE_DIM + relative_color * 2 + right]
 
 
+# ---------------------------------------------------------------------------
+# Bitboard attackers, computed against a *hypothetical* post-move position built from
+# move_updates()'s diff rather than an actual board.push(). board.attackers_mask() (what
+# board.attackers()/gives_check() ultimately call) takes an `occupied` override for exactly this
+# kind of x-ray query, but it still reads the real per-piece-type bitboards (self.rooks, etc.) --
+# fine for asking "what if this square were empty" but wrong for "what if this piece were
+# somewhere else", since the mover would still show up at its old square in those. So this
+# rebuilds the piece-type bitboards too, incrementally, off the same per-square deltas the NNUE
+# accumulator already computes -- one XOR per changed fact, not a board copy.
+# ---------------------------------------------------------------------------
+
+TypeBitboards = dict[int, int]
+
+
+def _bitboards_after(
+    board: chess.Board, move: chess.Move, updates: list[Update], mover_type: int
+) -> tuple[int, TypeBitboards, int]:
+    """(occupied, per-piece-type, mover-color-occupied) bitboards as they'll read once `move` is
+    played. King moves (including castling) are the one case move_updates() doesn't cover, since
+    HalfKP has no king-position feature to update for its own mover -- patched in here directly
+    from move.from_square/to_square."""
+    mover_color = board.turn
+    occupied = board.occupied
+    occupied_co = board.occupied_co[mover_color]
+    type_bb: TypeBitboards = {
+        chess.PAWN: board.pawns,
+        chess.KNIGHT: board.knights,
+        chess.BISHOP: board.bishops,
+        chess.ROOK: board.rooks,
+        chess.QUEEN: board.queens,
+        chess.KING: board.kings,
+    }
+    for square, piece_type, color, sign in updates:
+        bb = chess.BB_SQUARES[square]
+        if sign > 0:
+            occupied |= bb
+            type_bb[piece_type] |= bb
+            if color == mover_color:
+                occupied_co |= bb
+        else:
+            occupied &= ~bb
+            type_bb[piece_type] &= ~bb
+            if color == mover_color:
+                occupied_co &= ~bb
+
+    if mover_type == chess.KING:
+        from_bb, to_bb = chess.BB_SQUARES[move.from_square], chess.BB_SQUARES[move.to_square]
+        occupied = (occupied & ~from_bb) | to_bb
+        occupied_co = (occupied_co & ~from_bb) | to_bb
+        type_bb[chess.KING] = (type_bb[chess.KING] & ~from_bb) | to_bb
+
+    return occupied, type_bb, occupied_co
+
+
+def _attackers_bb(
+    color: bool, square: int, occupied: int, type_bb: TypeBitboards, occupied_co_color: int
+) -> int:
+    """Same computation as chess.Board.attackers_mask(), against whatever occupied/type/color
+    bitboards the caller hands it instead of the real board's own -- gives_check_fast() feeds it
+    a hypothetical post-move position, see() feeds it a position part-way through an exchange."""
+    rank_pieces = chess.BB_RANK_MASKS[square] & occupied
+    file_pieces = chess.BB_FILE_MASKS[square] & occupied
+    diag_pieces = chess.BB_DIAG_MASKS[square] & occupied
+    queens_and_rooks = type_bb[chess.QUEEN] | type_bb[chess.ROOK]
+    queens_and_bishops = type_bb[chess.QUEEN] | type_bb[chess.BISHOP]
+    attackers = (
+        (chess.BB_KING_ATTACKS[square] & type_bb[chess.KING])
+        | (chess.BB_KNIGHT_ATTACKS[square] & type_bb[chess.KNIGHT])
+        | (chess.BB_RANK_ATTACKS[square][rank_pieces] & queens_and_rooks)
+        | (chess.BB_FILE_ATTACKS[square][file_pieces] & queens_and_rooks)
+        | (chess.BB_DIAG_ATTACKS[square][diag_pieces] & queens_and_bishops)
+        | (chess.BB_PAWN_ATTACKS[not color][square] & type_bb[chess.PAWN])
+    )
+    return attackers & occupied_co_color
+
+
+def gives_check_fast(board: chess.Board, move: chess.Move) -> bool:
+    """Same answer as board.gives_check(move), without its push(move); is_check(); pop() -- a full
+    board mutation (castling rights, en passant square, halfmove clock, all of it) to answer one
+    yes/no question, paid for every move at every node. Direct checks (the moved or promoted piece
+    itself now attacking the king) and discovered checks (a slider unblocked by the square the
+    mover vacated) both fall out of the same _attackers_bb() call once the bitboards reflect the
+    move; en passant's double pawn removal and castling's rook move do too, since move_updates()
+    already models both. Only feeds move ordering and check extensions, never legality, so a
+    subtle bug here could mis-extend a rare line but can never produce an illegal move."""
+    mover_color = board.turn
+    enemy_king = board.king(not mover_color)
+    if enemy_king is None:
+        return False
+    mover_type = board.piece_type_at(move.from_square)
+    assert mover_type is not None
+
+    updates, _king_moved_color = move_updates(board, move)
+    occupied, type_bb, occupied_co = _bitboards_after(board, move, updates, mover_type)
+    return _attackers_bb(mover_color, enemy_king, occupied, type_bb, occupied_co) != 0
+
+
+# ---------------------------------------------------------------------------
+# Zobrist hashing: incrementally maintained the same way the NNUE accumulator is, so
+# board._transposition_key() -- an 11-item tuple (six piece bitboards, both occupied_co, turn,
+# clean_castling_rights(), and a has_legal_en_passant() probe) run through Python's generic tuple
+# hash() -- doesn't have to get rebuilt from scratch at every node. Piece placement, side to move,
+# and castling rights are cheap to update incrementally off the same move_updates() diff the
+# accumulator already computes. En passant legality is not a simple flag flip -- it's a real
+# pin-aware legality check (a pawn "able" to capture en passant might be pinned) -- so that one
+# component is still asked of the real board rather than re-derived by hand; by the time push()
+# reaches it, board.push(move) has already happened for real, so the question is cheap to ask
+# and free of the risk of getting the incremental version subtly wrong.
+# ---------------------------------------------------------------------------
+
+_ZOBRIST_RNG = random.Random(0x5A0B2157)
+ZOBRIST_PIECE: list[list[list[int]]] = [
+    [[_ZOBRIST_RNG.getrandbits(64) for _ in range(64)] for _ in range(6)] for _ in range(2)
+]
+ZOBRIST_CASTLING: list[int] = [_ZOBRIST_RNG.getrandbits(64) for _ in _CASTLING_LABELS]
+ZOBRIST_EP_FILE: list[int] = [_ZOBRIST_RNG.getrandbits(64) for _ in range(8)]
+ZOBRIST_TURN = _ZOBRIST_RNG.getrandbits(64)
+
+
+def _ep_zobrist(board: chess.Board) -> int:
+    if not board.has_legal_en_passant():
+        return 0
+    assert board.ep_square is not None
+    return ZOBRIST_EP_FILE[chess.square_file(board.ep_square)]
+
+
+def zobrist_hash(board: chess.Board) -> int:
+    """Full from-scratch computation -- used once per game, in Accumulator.set_position(), to seed
+    the value push()/pop() keep incrementally in sync from there."""
+    h = 0
+    for color in (chess.WHITE, chess.BLACK):
+        for piece_type in range(1, 7):
+            for square in chess.scan_reversed(board.pieces_mask(piece_type, color)):
+                h ^= ZOBRIST_PIECE[color][piece_type - 1][square]
+    if board.turn == chess.BLACK:
+        h ^= ZOBRIST_TURN
+    for i, has_right in enumerate(_castling_rights(board)):
+        if has_right:
+            h ^= ZOBRIST_CASTLING[i]
+    h ^= _ep_zobrist(board)
+    return h
+
+
 class Accumulator:
     """Owns both perspectives' running accumulator and the board itself, so the two can never
     drift out of sync: every push/pop goes through here instead of `board.push`/`board.pop`."""
@@ -406,7 +552,8 @@ class Accumulator:
         self.weight = weight  # int16
         self.white_acc = np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
         self.black_acc = np.zeros(ACCUMULATOR_DIM, dtype=_ACC_DTYPE)
-        self._stack: list[tuple[np.ndarray, np.ndarray, bool]] = []
+        self.zobrist = 0
+        self._stack: list[tuple[np.ndarray, np.ndarray, bool, int]] = []
         # Latches True once neither side has any castling right left — a one-way state in a real
         # game (rights are never regained), but search pushes and pops constantly across branches,
         # so this has to travel with the push/pop stack like the accumulators do, not live as a
@@ -418,6 +565,7 @@ class Accumulator:
         self.white_acc = self._full(board, chess.WHITE)
         self.black_acc = self._full(board, chess.BLACK)
         self._castling_exhausted = not any(_castling_rights(board))
+        self.zobrist = zobrist_hash(board)
         self._stack.clear()
 
     def _full(self, board: chess.Board, perspective: bool) -> np.ndarray:
@@ -435,12 +583,31 @@ class Accumulator:
         return np.concatenate([stm, nstm])
 
     def push(self, board: chess.Board, move: chess.Move) -> None:
-        self._stack.append((self.white_acc.copy(), self.black_acc.copy(), self._castling_exhausted))
+        self._stack.append(
+            (self.white_acc.copy(), self.black_acc.copy(), self._castling_exhausted, self.zobrist)
+        )
+        ep_before = _ep_zobrist(board)
         if move == chess.Move.null():
             board.push(move)
+            # A null move can't create an en passant right, only forfeit one -- _ep_zobrist(board)
+            # after the push is always 0, but asking fresh rather than assuming that keeps this in
+            # one place instead of two ways of computing the same fact.
+            self.zobrist ^= ZOBRIST_TURN ^ ep_before ^ _ep_zobrist(board)
             return
 
+        mover_type = board.piece_type_at(move.from_square)
+        assert mover_type is not None
+        mover_color = board.turn
         updates, king_moved_color = move_updates(board, move)
+
+        zobrist = self.zobrist
+        for square, piece_type, color, _sign in updates:
+            zobrist ^= ZOBRIST_PIECE[color][piece_type - 1][square]
+        if mover_type == chess.KING:
+            zobrist ^= ZOBRIST_PIECE[mover_color][chess.KING - 1][move.from_square]
+            zobrist ^= ZOBRIST_PIECE[mover_color][chess.KING - 1][move.to_square]
+        zobrist ^= ZOBRIST_TURN
+
         # Once neither side has a right left, no move can ever change that — skip both the
         # before/after snapshots and the diff entirely instead of confirming the same "nothing to
         # lose" answer on every remaining push down this branch.
@@ -460,6 +627,8 @@ class Accumulator:
                 self._castling_exhausted = True
             lost_rights = _lost_castling_rights(rights_before, rights_after)
             if lost_rights:
+                for label in lost_rights:
+                    zobrist ^= ZOBRIST_CASTLING[_CASTLING_LABEL_INDEX[label]]
                 for perspective, acc in (
                     (chess.WHITE, self.white_acc),
                     (chess.BLACK, self.black_acc),
@@ -468,6 +637,8 @@ class Accumulator:
                         continue  # gets a full refresh below, reflecting the new rights anyway
                     _apply_castling_losses(acc, self.weight, perspective, lost_rights)
 
+        self.zobrist = zobrist ^ ep_before ^ _ep_zobrist(board)
+
         if king_moved_color == chess.WHITE:
             self.white_acc = self._full(board, chess.WHITE)
         elif king_moved_color == chess.BLACK:
@@ -475,7 +646,7 @@ class Accumulator:
 
     def pop(self, board: chess.Board) -> None:
         board.pop()
-        self.white_acc, self.black_acc, self._castling_exhausted = self._stack.pop()
+        self.white_acc, self.black_acc, self._castling_exhausted, self.zobrist = self._stack.pop()
 
 
 _ACC = Accumulator(_WEIGHTS.ft_weight)
@@ -491,7 +662,7 @@ class TTSlot(NamedTuple):
     depth: int
     score: float
     flag: str
-    best_move: str | None
+    best_move: chess.Move | None
 
 
 # A plain dict here would grow to over a million entries over a long game, and periodically
@@ -502,7 +673,7 @@ class TTSlot(NamedTuple):
 # never needs clearing between games either — a stale slot from a different position just fails
 # the signature check below and is treated as a miss.
 TT_SIZE = 1_000_000
-GAME_HISTORY: Counter[Hashable] = Counter()
+GAME_HISTORY: Counter[int] = Counter()
 TT: list[TTSlot | None] = [None] * TT_SIZE
 KILLERS_PER_DEPTH = 2
 KILLERS: dict[int, list[chess.Move]] = {}
@@ -565,12 +736,12 @@ class SearchTimeout(Exception):
     pass
 
 
-def tt_slot_index(key: Hashable) -> tuple[int, int]:
-    """Map a position key to (slot index, verification signature). `hash()` on the key's own
-    tuple of piece bitboards is already a well-distributed 64-bit-ish value — masked positive and
-    reduced mod TT_SIZE for the slot, kept in full as the signature stored in that slot so a
-    different position landing on the same index is detected instead of silently mistaken for a
-    hit."""
+def tt_slot_index(key: int) -> tuple[int, int]:
+    """Map a position key to (slot index, verification signature). `hash()` on the key -- an
+    already well-distributed 64-bit-ish int from zobrist_hash()/Accumulator.zobrist, XORed
+    together from independent random per-fact terms -- is masked positive and reduced mod TT_SIZE
+    for the slot, kept in full as the signature stored in that slot so a different position
+    landing on the same index is detected instead of silently mistaken for a hit."""
     sig = hash(key) & 0xFFFFFFFFFFFFFFFF
     return sig % TT_SIZE, sig
 
@@ -673,12 +844,13 @@ def store_killer(depth: int, move: chess.Move) -> None:
 def score_move(
     board: chess.Board,
     move: chess.Move,
-    tt_move_uci: str | None = None,
+    tt_move: chess.Move | None = None,
     killers: list[chess.Move] | None = None,
 ) -> float:
     # Tiers widely spaced so nothing in one can outscore the next: TT move, promotions, captures,
-    # killers, then everything else falls through to 0.
-    if tt_move_uci and move.uci() == tt_move_uci:
+    # killers, then everything else falls through to 0. Compares the TT move by field equality
+    # (Move.__eq__), not by building and comparing UCI strings for every move at every node.
+    if tt_move is not None and move == tt_move:
         return 1000000.0
 
     score = 0.0
@@ -686,10 +858,10 @@ def score_move(
         score += 90000.0 + PIECE_VALUE.get(move.promotion, 0)
 
     if board.is_capture(move):
-        victim = board.piece_at(move.to_square)
-        attacker = board.piece_at(move.from_square)
-        victim_val = PIECE_VALUE.get(victim.piece_type, 100.0) if victim else 100.0
-        attacker_val = PIECE_VALUE.get(attacker.piece_type, 100.0) if attacker else 100.0
+        victim_type = board.piece_type_at(move.to_square)
+        attacker_type = board.piece_type_at(move.from_square)
+        victim_val = PIECE_VALUE.get(victim_type, 100.0) if victim_type is not None else 100.0
+        attacker_val = PIECE_VALUE.get(attacker_type, 100.0) if attacker_type is not None else 100.0
         score += 10000.0 + victim_val - (attacker_val / 100.0)
     elif killers and move in killers:
         score += 9000.0
@@ -697,57 +869,100 @@ def score_move(
     return score
 
 
+_SEE_TYPE_ORDER = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
+
+
 def see(board: chess.Board, move: chess.Move) -> float:
     """Static exchange evaluation: play out every recapture on move.to_square, both sides always
     answering with their least valuable attacker, and return the net material result for the side
     making `move`. Unlike MVV-LVA (a one-ply guess), this accounts for the whole exchange — Pawn
-    takes Queen defended by a Pawn scores as a loss, not a win. Works on a scratch copy of the
-    board via piece placement rather than push/pop, since move-legality (check detection, etc.)
-    is irrelevant to who wins an exchange and would only slow this down."""
+    takes Queen defended by a Pawn scores as a loss, not a win. Works against a handful of local
+    bitboards rather than a scratch chess.Board (board.copy(stack=False) plus a remove_piece_at/
+    set_piece_at pair per step) — that scratch board still pays for promoted-piece tracking,
+    occupied_co bookkeeping, and Piece object allocations this doesn't need, since move-legality
+    is irrelevant to who wins an exchange. Reuses _attackers_bb(), the same helper
+    gives_check_fast() uses, for "who can recapture here" at each step."""
     to_square = move.to_square
-    attacker = board.piece_at(move.from_square)
-    assert attacker is not None
+    to_bb = chess.BB_SQUARES[to_square]
+    attacker_type = board.piece_type_at(move.from_square)
+    assert attacker_type is not None
+    attacker_color = board.turn
 
-    scratch = board.copy(stack=False)
-    if scratch.is_en_passant(move):
+    occupied = board.occupied
+    type_bb: TypeBitboards = {
+        chess.PAWN: board.pawns,
+        chess.KNIGHT: board.knights,
+        chess.BISHOP: board.bishops,
+        chess.ROOK: board.rooks,
+        chess.QUEEN: board.queens,
+        chess.KING: board.kings,
+    }
+    occ_co = [board.occupied_co[False], board.occupied_co[True]]  # indexed like board.occupied_co
+
+    if board.is_en_passant(move):
         captured_value = SEE_PIECE_VALUE[chess.PAWN]
-        scratch.remove_piece_at(to_square + (-8 if attacker.color == chess.WHITE else 8))
+        captured_square = to_square + (-8 if attacker_color == chess.WHITE else 8)
+        captured_bb = chess.BB_SQUARES[captured_square]
+        occupied &= ~captured_bb
+        type_bb[chess.PAWN] &= ~captured_bb
+        occ_co[not attacker_color] &= ~captured_bb
     else:
-        captured = scratch.piece_at(to_square)
-        captured_value = SEE_PIECE_VALUE.get(captured.piece_type, 0.0) if captured else 0.0
+        captured_type = board.piece_type_at(to_square)
+        captured_value = (
+            SEE_PIECE_VALUE.get(captured_type, 0.0) if captured_type is not None else 0.0
+        )
+        if captured_type is not None:
+            type_bb[captured_type] &= ~to_bb
+            occ_co[not attacker_color] &= ~to_bb
 
-    scratch.remove_piece_at(move.from_square)
-    scratch.set_piece_at(to_square, attacker)
+    # A promoting move leaves a different piece on to_square than the one that left from_square --
+    # moved_type is what subsequent recaptures in the exchange actually have to reckon with.
+    moved_type = move.promotion if move.promotion else attacker_type
+
+    from_bb = chess.BB_SQUARES[move.from_square]
+    occupied = (occupied & ~from_bb) | to_bb
+    type_bb[attacker_type] &= ~from_bb
+    type_bb[moved_type] |= to_bb
+    occ_co[attacker_color] = (occ_co[attacker_color] & ~from_bb) | to_bb
+    current_type, current_color = moved_type, attacker_color
 
     # The classic "swap" algorithm: build up the list of material swings as each side in turn
     # recaptures with its cheapest attacker, then fold the list back to front so each side is
     # credited with stopping the exchange the moment continuing it would lose them material.
     gains = [captured_value]
-    occupant_value = SEE_PIECE_VALUE.get(attacker.piece_type, 0.0)
-    side = not attacker.color
+    occupant_value = SEE_PIECE_VALUE.get(moved_type, 0.0)
+    side = not attacker_color
 
     while True:
-        attackers = scratch.attackers(side, to_square)
+        attackers = _attackers_bb(side, to_square, occupied, type_bb, occ_co[side])
         if not attackers:
             break
-        least_square = min(attackers, key=lambda sq: _piece_see_value(scratch, sq))
-        least_piece = scratch.piece_at(least_square)
-        assert least_piece is not None
+        for least_type in _SEE_TYPE_ORDER:
+            candidates = attackers & type_bb[least_type]
+            if candidates:
+                least_square = chess.msb(candidates)
+                break
+        else:
+            break  # unreachable: attackers != 0 and every piece type is covered above
+
+        least_bb = chess.BB_SQUARES[least_square]
         gains.append(occupant_value - gains[-1])
-        occupant_value = SEE_PIECE_VALUE.get(least_piece.piece_type, 0.0)
-        scratch.remove_piece_at(least_square)
-        scratch.set_piece_at(to_square, least_piece)
+        occupant_value = SEE_PIECE_VALUE.get(least_type, 0.0)
+
+        occupied &= ~least_bb
+        type_bb[least_type] &= ~least_bb
+        occ_co[side] &= ~least_bb
+        type_bb[current_type] &= ~to_bb
+        occ_co[current_color] &= ~to_bb
+        occupied |= to_bb
+        type_bb[least_type] |= to_bb
+        occ_co[side] |= to_bb
+        current_type, current_color = least_type, side
         side = not side
 
     for i in range(len(gains) - 2, -1, -1):
         gains[i] = -max(-gains[i], gains[i + 1])
     return gains[0]
-
-
-def _piece_see_value(board: chess.Board, square: int) -> float:
-    piece = board.piece_at(square)
-    assert piece is not None
-    return SEE_PIECE_VALUE.get(piece.piece_type, 0.0)
 
 
 def qsearch(
@@ -806,12 +1021,12 @@ def negamax(
     beta: float,
     start_time: float,
     time_limit: float,
-    path_keys: set[Hashable],
+    path_keys: set[int],
 ) -> float:
     if time.time() - start_time > time_limit:
         raise SearchTimeout()
 
-    key = board._transposition_key()
+    key = _ACC.zobrist
 
     # is_fifty_moves() is halfmove_clock >= 100 with a built-in check that no other means of
     # ending the game (checkmate, stalemate) takes precedence — exactly the guard this needs,
@@ -820,12 +1035,12 @@ def negamax(
         return contempt_score(board)
 
     alpha_orig = alpha
-    tt_move_uci = None
+    tt_move: chess.Move | None = None
     tt_index, tt_sig = tt_slot_index(key)
     tt_slot = TT[tt_index]
 
     if tt_slot is not None and tt_slot.sig == tt_sig:
-        tt_move_uci = tt_slot.best_move
+        tt_move = tt_slot.best_move
         if tt_slot.depth >= depth:
             if tt_slot.flag == "EXACT":
                 return tt_slot.score
@@ -861,17 +1076,17 @@ def negamax(
         return 0.0
 
     killers = KILLERS.get(depth)
-    legal_moves.sort(key=lambda m: score_move(board, m, tt_move_uci, killers), reverse=True)
+    legal_moves.sort(key=lambda m: score_move(board, m, tt_move, killers), reverse=True)
 
     static_eval = evaluate(board) if depth == 1 and not in_check and beta < MATE_SCORE else None
 
     best_score = -float("inf")
-    best_move_for_tt = None
+    best_move_for_tt: chess.Move | None = None
     path_keys.add(key)
 
     for move_index, move in enumerate(legal_moves):
         is_tactical = board.is_capture(move) or move.promotion is not None
-        gives_check = board.gives_check(move)
+        gives_check = gives_check_fast(board, move)
 
         if (
             static_eval is not None
@@ -928,7 +1143,7 @@ def negamax(
 
         if score > best_score:
             best_score = score
-            best_move_for_tt = move.uci()
+            best_move_for_tt = move
 
         if best_score > alpha:
             alpha = best_score
@@ -970,7 +1185,7 @@ def search_root(
     beta: float,
     start_time: float,
     time_limit: float,
-    base_path_keys: set[Hashable],
+    base_path_keys: set[int],
 ) -> tuple[float, chess.Move]:
     """One pass over the root move list against a fixed [alpha, beta] window. The caller
     (get_move) owns widening and retrying when the result lands on or outside that window — this
@@ -1011,7 +1226,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     if board.halfmove_clock == 0:
         GAME_HISTORY.clear()
 
-    key = board._transposition_key()
+    key = _ACC.zobrist
     GAME_HISTORY[key] += 1
 
     base_path_keys = set(GAME_HISTORY.keys())
@@ -1055,7 +1270,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             ):
                 break
 
-            moves.sort(key=lambda m: score_move(board, m, best_move.uci()), reverse=True)
+            moves.sort(key=lambda m: score_move(board, m, best_move), reverse=True)
 
             # Aspiration windows: depth d-1's score is almost always close to depth d's, so start
             # narrow around it instead of wide open — a tight window prunes far more aggressively
