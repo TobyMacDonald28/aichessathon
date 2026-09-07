@@ -241,14 +241,39 @@ STARTING_NON_PAWN_MATERIAL = 2 * (2 * 320.0 + 2 * 330.0 + 2 * 500.0 + 900.0)
 def phase_tag(board: chess.Board) -> float:
     """Non-pawn material still on the board (both sides), normalized against the starting total:
     1.0 at the game's start, trending toward 0.0 as pieces (not pawns) come off. A cheap proxy for
-    how "middlegame" vs "endgame" a position is — captured now for later phase-stratified sampling
-    or a phase-interpolated output head, neither built yet, just the signal."""
+    how "middlegame" vs "endgame" a position is — feeds phase_bucket() below for the multi-head
+    NNUE, and is worth keeping on disk regardless for any future phase-stratified sampling."""
     material = sum(
         len(board.pieces(piece_type, color)) * value
         for piece_type, value in PHASE_PIECE_VALUE.items()
         for color in (chess.WHITE, chess.BLACK)
     )
     return material / STARTING_NON_PAWN_MATERIAL
+
+
+# Phase bucketing: one shared feature transformer (so there's still only one accumulator to push
+# and pop through search — no extra per-node cost there), but NUM_PHASE_BUCKETS separate small head
+# networks, selected by how much non-pawn material is left. Trained together in the same batches,
+# not as separate models, so the buckets share gradient signal through the embedding table and the
+# optimizer keeps adjacent buckets' outputs from diverging into a discontinuity search can't trust.
+# Bucket 0 is the most material (opening-ish), NUM_PHASE_BUCKETS - 1 the least (bare-king-ish
+# endgames) -- equal-width bands over phase_tag's [0.0, 1.0] range, not tuned against real phase
+# transition points, since the training data ends up ample either way (a few tens of millions of
+# positions per bucket out of a 100M+ position fetch).
+NUM_PHASE_BUCKETS = 4
+
+
+def phase_bucket(phase: float) -> int:
+    """agent.py keeps its own copy of this (and of phase_tag) rather than importing train.py --
+    see the module docstring on why agent.py is self-contained. Keep the two in sync by hand if
+    NUM_PHASE_BUCKETS or the bucketing rule ever changes."""
+    return min(int((1.0 - phase) * NUM_PHASE_BUCKETS), NUM_PHASE_BUCKETS - 1)
+
+
+def _phase_bucket_array(phase: np.ndarray) -> np.ndarray:
+    """Same rule as phase_bucket(), vectorized over fit()'s whole phase.f32 array at once."""
+    bucket = ((1.0 - phase) * NUM_PHASE_BUCKETS).astype(np.int64)
+    return np.clip(bucket, 0, NUM_PHASE_BUCKETS - 1)
 
 
 _Row = tuple[np.ndarray, np.ndarray, np.float32, np.float32]  # stm, nstm, target, phase
@@ -382,6 +407,202 @@ def fetch(
 
 
 # ---------------------------------------------------------------------------
+# fetch_hf: same output format as fetch() above (stm/nstm/targets/phase + count.npy), sourced from
+# theoden8/nnue-chess-dataset on Hugging Face instead of the Lichess eval dump. Three parquet
+# files under one dataset: bulk game evaluations, puzzle positions (tactically sharp, the pre- and
+# post-mistake side of each puzzle), and tablebase-backed endgames (5-man Syzygy) -- the latter two
+# specifically target exactly the tactical/endgame gaps found testing the Lichess-only model, and
+# are small enough (1.3GB combined) to take in full rather than sampled.
+# ---------------------------------------------------------------------------
+
+# HF's dataset-viewer auto-conversion of the 3 source files into one uniform (fen, score, depth,
+# knodes) schema -- confirmed against https://datasets-server.huggingface.co's preview API, not
+# guessed. `fen` is compressed (see _decompress_fen below); `score` is already plain centipawns
+# from White's perspective, mate lines included in-range (no separate PV/mate marker like the
+# Lichess dump has, so a "mate soon" row and a merely-huge-cp row are indistinguishable here --
+# TARGET_CLIP_CP below just clips both the same way, less distinctive than MATE_TARGET_CP but the
+# only honest option this schema supports).
+_HF_BASE = "https://huggingface.co/api/datasets/theoden8/nnue-chess-dataset/parquet/default/train"
+HF_PARQUET_URLS = [
+    f"{_HF_BASE}/1.parquet",  # endgames, ~1.04GB, taken in full
+    f"{_HF_BASE}/2.parquet",  # puzzles, ~281MB, taken in full
+    f"{_HF_BASE}/0.parquet",  # evaluations (bulk), ~8.77GB -- truncated once num_positions is hit
+]
+# The puzzle/endgame files are Stockfish-16-at-depth-12 by construction (see the dataset card) --
+# MIN_DEPTH (16, tuned for the Lichess dump's much more variable analysis depth) would reject every
+# single one of them. Their value here is curation (tactically critical, tablebase-perfect), not
+# raw search depth, so this floor only exists to drop the rare shallow/unreliable row.
+HF_MIN_DEPTH = 10
+
+_HF_PIECE_NIBBLE = "KQRBNPkqrbnp"
+
+
+def _decompress_fen(data: bytes) -> str:
+    """Ports dummy_chess's compress::decompress_fen (C++, github.com/theoden8/dummy_chess,
+    FEN.hpp) to Python -- this dataset's `fen` column is exactly that format, and there's no
+    Python package for it. Nibble-packed board (piece index or an empty-run count), then 6 bytes
+    of metadata (castling as two file-bitmasks, en passant square, halfmove clock, fullmove
+    number as 2 bytes). Verified against 100 real sample rows via the HF datasets-server preview
+    API: every one round-trips through this into a FEN python-chess accepts as legal. Raises
+    ValueError on chess960/crazyhouse (flag bits 1/2) or a malformed row -- both simply get
+    dropped by the caller, not corrected or guessed at."""
+    if len(data) < 8:
+        raise ValueError("too short")
+    flags = data[0]
+    if flags & 0b110:
+        raise ValueError("chess960/crazyhouse not supported")
+
+    meta_size = 6
+    board_end = len(data) - meta_size
+    nibs = []
+    for byte in data[1:board_end]:
+        nibs.append((byte >> 4) & 0xF)
+        nibs.append(byte & 0xF)
+
+    board: list[str] = []
+    sq, i = 0, 0
+    while i < len(nibs) and sq < 64:
+        nib = nibs[i]
+        if nib == 0xC and i + 1 < len(nibs):  # empty run
+            count = nibs[i + 1] + 1
+            board.extend([" "] * count)
+            sq += count
+            i += 2
+        elif nib < 12:
+            board.append(_HF_PIECE_NIBBLE[nib])
+            sq += 1
+            i += 1
+        else:  # 0xF padding
+            break
+    if len(board) != 64:
+        raise ValueError(f"board length {len(board)}")
+
+    # board is already in FEN row order (rank8 a..h, ..., rank1 a..h) -- compress_fen wrote it by
+    # iterating the source FEN string directly, so no rank/file remapping is needed here.
+    fen_rows = []
+    for r in range(8):
+        row, out, empty = board[r * 8 : r * 8 + 8], "", 0
+        for c in row:
+            if c == " ":
+                empty += 1
+                continue
+            if empty:
+                out += str(empty)
+                empty = 0
+            out += c
+        fen_rows.append(out + (str(empty) if empty else ""))
+
+    m = board_end
+    white_byte, black_byte, ep_byte, halfmove = data[m], data[m + 1], data[m + 2], data[m + 3]
+    fullmove = data[m + 4] | (data[m + 5] << 8)
+
+    castling = "".join(
+        flag
+        for mask, flag in ((white_byte & 0x80, "K"), (white_byte & 0x01, "Q"),
+                            (black_byte & 0x80, "k"), (black_byte & 0x01, "q"))
+        if mask
+    ) or "-"
+    # En passant square encoding wasn't directly confirmed (no sample row had one set) -- unused
+    # by halfkp_indices/castling_indices either way, so a wrong guess here can't corrupt a feature,
+    # only get the row dropped later if python-chess rejects the resulting FEN as illegal.
+    ep = "-" if ep_byte >= 64 else chr(ord("a") + ep_byte % 8) + str(ep_byte // 8 + 1)
+
+    turn = "b" if flags & 1 else "w"
+    return f"{'/'.join(fen_rows)} {turn} {castling} {ep} {halfmove} {max(fullmove, 1)}"
+
+
+_HfRow = tuple[bytes, int, int]  # fen (compressed), score (cp, White's pov), depth
+
+
+def _process_hf_row(row: _HfRow) -> _ProcessResult:
+    fen_bytes, score, depth = row
+    if depth < HF_MIN_DEPTH:
+        return "depth", None
+    try:
+        fen = _decompress_fen(fen_bytes)
+        board = chess.Board(fen)
+    except (ValueError, IndexError):
+        return "json_error", None  # reusing fetch()'s bucket name for "row didn't parse"
+
+    cp = max(-TARGET_CLIP_CP, min(TARGET_CLIP_CP, float(score)))
+    target = cp if board.turn == chess.WHITE else -cp
+
+    stm = halfkp_indices(board, board.turn)
+    nstm = halfkp_indices(board, not board.turn)
+    if len(stm) > MAX_ACTIVE or len(nstm) > MAX_ACTIVE:
+        return "too_many_pieces", None
+
+    return None, (_padded(stm), _padded(nstm), np.float32(target), np.float32(phase_tag(board)))
+
+
+def _iter_hf_parquet_rows(url: str) -> Iterator[_HfRow]:
+    import fsspec
+    import pyarrow.parquet as pq
+
+    with fsspec.open(url, mode="rb") as f:
+        parquet_file = pq.ParquetFile(f)
+        for i in range(parquet_file.num_row_groups):
+            table = parquet_file.read_row_group(i, columns=["fen", "score", "depth"])
+            fens = table.column("fen").to_pylist()
+            scores = table.column("score").to_pylist()
+            depths = table.column("depth").to_pylist()
+            yield from zip(fens, scores, depths, strict=True)
+
+
+def fetch_hf(num_positions: int, data_dir: Path = DATA_DIR) -> None:
+    """Same output files as fetch(), sourced from HF_PARQUET_URLS instead of the Lichess dump --
+    see the module comment above. Row groups (100k rows each) are the unit of work handed to the
+    process pool, not individual rows, since a single row is too little work to be worth an IPC
+    round trip; _process_hf_row itself still runs one row at a time inside each worker."""
+    data_dir.mkdir(exist_ok=True)
+    stm_path = data_dir / "stm_indices.i32"
+    nstm_path = data_dir / "nstm_indices.i32"
+    targets_path = data_dir / "targets.f32"
+    phase_path = data_dir / "phase.f32"
+    count_path = data_dir / "count.npy"
+
+    kept, seen = 0, 0
+    dropped = {"json_error": 0, "depth": 0, "too_many_pieces": 0}
+
+    workers = max(1, (os.cpu_count() or 2) - 1)
+    with (
+        open(stm_path, "wb") as stm_out,
+        open(nstm_path, "wb") as nstm_out,
+        open(targets_path, "wb") as target_out,
+        open(phase_path, "wb") as phase_out,
+        multiprocessing.Pool(processes=workers) as pool,
+    ):
+        for url in HF_PARQUET_URLS:
+            if kept >= num_positions:
+                break
+            print(f"streaming {url}", file=sys.stderr)
+            for drop_reason, result in pool.imap_unordered(
+                _process_hf_row, _iter_hf_parquet_rows(url), chunksize=256
+            ):
+                seen += 1
+                if result is None:
+                    assert drop_reason is not None
+                    dropped[drop_reason] += 1
+                    continue
+
+                stm_arr, nstm_arr, target, phase = result
+                stm_out.write(stm_arr.tobytes())
+                nstm_out.write(nstm_arr.tobytes())
+                target_out.write(target.tobytes())
+                phase_out.write(phase.tobytes())
+
+                kept += 1
+                if kept % 50000 == 0:
+                    print(f"kept {kept} / seen {seen}", file=sys.stderr)
+                if kept >= num_positions:
+                    break
+
+    np.save(count_path, np.array([kept], dtype=np.int64))
+    print(f"done: kept {kept} positions from {seen} rows seen", file=sys.stderr)
+    print(f"dropped by filter: {dropped}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # fit: train NNUE on the dataset fetch() produced.
 # ---------------------------------------------------------------------------
 
@@ -464,24 +685,44 @@ def fit(
     from torch import nn
 
     class NNUE(nn.Module):
+        """One shared feature transformer (one accumulator, so search still only ever pushes/pops
+        a single embedding sum per side) feeding NUM_PHASE_BUCKETS separate small head networks.
+        Trained together in the same batches rather than as separate models, so the buckets share
+        gradient signal through the embedding table -- the optimizer keeps adjacent buckets from
+        diverging into a discontinuity alpha-beta can't trust move-to-move."""
+
         def __init__(self) -> None:
             super().__init__()
             self.feature_transformer = nn.EmbeddingBag(
                 FEATURE_DIM + 1, ACCUMULATOR_DIM, mode="sum", padding_idx=PAD_INDEX
             )
-            self.head = nn.Sequential(
-                nn.ReLU(),
-                nn.Linear(ACCUMULATOR_DIM * 2, 32),
-                nn.ReLU(),
-                nn.Linear(32, 32),
-                nn.ReLU(),
-                nn.Linear(32, 1),
-            )
 
-        def forward(self, stm_indices: torch.Tensor, nstm_indices: torch.Tensor) -> torch.Tensor:
+            def make_head() -> nn.Sequential:
+                return nn.Sequential(
+                    nn.ReLU(),
+                    nn.Linear(ACCUMULATOR_DIM * 2, 32),
+                    nn.ReLU(),
+                    nn.Linear(32, 32),
+                    nn.ReLU(),
+                    nn.Linear(32, 1),
+                )
+
+            self.heads = nn.ModuleList([make_head() for _ in range(NUM_PHASE_BUCKETS)])
+
+        def forward(
+            self, stm_indices: torch.Tensor, nstm_indices: torch.Tensor, bucket: torch.Tensor
+        ) -> torch.Tensor:
             stm_acc = self.feature_transformer(stm_indices)
             nstm_acc = self.feature_transformer(nstm_indices)
-            return self.head(torch.cat([stm_acc, nstm_acc], dim=1))
+            combined = torch.cat([stm_acc, nstm_acc], dim=1)
+            # Every head runs on the whole batch -- cheap, a few small matmuls each, dwarfed by
+            # the embedding lookups above -- then gather gets, per row, only the one head's output
+            # that row's phase actually belongs to. Simpler and less bug-prone than masking out
+            # per-bucket sub-batches, at the cost of computing (and discarding the gradient for)
+            # NUM_PHASE_BUCKETS - 1 unused outputs per row; training-only cost, inference in
+            # agent.py picks one head's weights up front and never runs the others at all.
+            all_heads = torch.stack([head(combined) for head in self.heads], dim=1)
+            return all_heads.gather(1, bucket.view(-1, 1, 1)).squeeze(1)
 
     count = int(np.load(data_dir / "count.npy")[0])
     stm_indices = np.memmap(
@@ -491,8 +732,8 @@ def fit(
         data_dir / "nstm_indices.i32", dtype=np.int32, mode="r", shape=(count, MAX_ACTIVE)
     )
     targets = np.memmap(data_dir / "targets.f32", dtype=np.float32, mode="r", shape=(count,))
-    # phase.f32 (data_dir / "phase.f32") is captured by fetch() but not consumed here yet -- for
-    # later phase-stratified sampling or a phase-interpolated head, neither built yet.
+    phase = np.memmap(data_dir / "phase.f32", dtype=np.float32, mode="r", shape=(count,))
+    bucket_all = _phase_bucket_array(np.asarray(phase))
 
     rng = np.random.default_rng(0)
     order = rng.permutation(count)
@@ -536,17 +777,18 @@ def fit(
             stm = torch.from_numpy(stm_indices[batch].astype(np.int64)).to(resolved_device)
             nstm = torch.from_numpy(nstm_indices[batch].astype(np.int64)).to(resolved_device)
             y = torch.from_numpy(targets[batch].astype(np.float32)).unsqueeze(1).to(resolved_device)
+            bucket = torch.from_numpy(bucket_all[batch]).to(resolved_device)
             w = None
             if sample_weight is not None:
                 w = torch.from_numpy(sample_weight[batch]).unsqueeze(1).to(resolved_device)
-            yield stm, nstm, y, w
+            yield stm, nstm, y, bucket, w
 
     for epoch in range(epochs):
         model.train()
         train_loss, train_cp_err, n = 0.0, 0.0, 0
-        for step, (stm, nstm, y, w) in enumerate(batches(train_idx, shuffle=True), start=1):
+        for step, (stm, nstm, y, bucket, w) in enumerate(batches(train_idx, shuffle=True), start=1):
             optimizer.zero_grad()
-            pred = model(stm, nstm)
+            pred = model(stm, nstm, bucket)
             loss = _wdl_loss(pred, y, weight=w)
             loss.backward()
             optimizer.step()
@@ -564,8 +806,8 @@ def fit(
         model.eval()
         val_loss, val_cp_err, vn = 0.0, 0.0, 0
         with torch.no_grad():
-            for stm, nstm, y, _ in batches(val_idx, shuffle=False):
-                pred = model(stm, nstm)
+            for stm, nstm, y, bucket, _ in batches(val_idx, shuffle=False):
+                pred = model(stm, nstm, bucket)
                 val_loss += _wdl_loss(pred, y).item() * len(y)
                 val_cp_err += (pred - y).abs().sum().item()
                 vn += len(y)
@@ -600,6 +842,14 @@ def main() -> None:
         default=DATA_DIR,
         help="where to write the dataset (default mlp/data_v2/) -- never overwrites mlp/data/",
     )
+    fetch_parser.add_argument(
+        "--source",
+        choices=["lichess", "huggingface"],
+        default="lichess",
+        help="lichess: database.lichess.org eval dump (--sample-every applies). huggingface: "
+        "theoden8/nnue-chess-dataset (endgames + puzzles in full, then bulk evaluations until "
+        "--positions is reached; --sample-every is ignored, needs pyarrow/fsspec/aiohttp)",
+    )
 
     fit_parser = subparsers.add_parser("fit")
     fit_parser.add_argument("--epochs", type=int, default=20)
@@ -633,7 +883,10 @@ def main() -> None:
 
     arguments = parser.parse_args()
     if arguments.command == "fetch":
-        fetch(arguments.positions, arguments.sample_every, arguments.data_dir)
+        if arguments.source == "huggingface":
+            fetch_hf(arguments.positions, arguments.data_dir)
+        else:
+            fetch(arguments.positions, arguments.sample_every, arguments.data_dir)
     else:
         fit(
             arguments.epochs,

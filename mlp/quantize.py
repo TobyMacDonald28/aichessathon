@@ -28,17 +28,18 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from train import WEIGHTS_PATH
+from train import NUM_PHASE_BUCKETS, WEIGHTS_PATH
 
 DEFAULT_OUTPUT = Path(__file__).parent / "weights.npz"
 
 FEATURE_TRANSFORMER_BITS = 16  # summed over up to 32 rows; int8 rounding error compounds too much
 HEAD_BITS = 8  # one matmul, not a sum of many rows — int8 rounds cleanly, and enables SIMD
 
-QUANTIZED_KEYS = {
-    "feature_transformer.weight": FEATURE_TRANSFORMER_BITS,
-    "head.1.weight": HEAD_BITS,
-}
+# state_dict keys are "heads.{i}.1.weight" (nn.ModuleList of nn.Sequential, one per phase bucket)
+# now, not the single "head.1.weight" of the pre-phase-bucketing checkpoint format.
+QUANTIZED_KEYS = {"feature_transformer.weight": FEATURE_TRANSFORMER_BITS}
+for _i in range(NUM_PHASE_BUCKETS):
+    QUANTIZED_KEYS[f"heads.{_i}.1.weight"] = HEAD_BITS
 
 
 def quantize_tensor(weight: np.ndarray, bits: int) -> tuple[np.ndarray, float]:

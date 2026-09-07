@@ -118,18 +118,24 @@ BOOK_PATH = Path(__file__).parent / "book.bin"
 FEATURE_TRANSFORMER_BITS = 16  # summed over up to 32 rows; int8 rounding error compounds too much
 HEAD_BITS = 8  # one matmul, not a sum of many rows — int8 rounds cleanly, and enables SIMD
 
+# Phase bucketing: one shared feature transformer (evaluate() still only ever reads one pair of
+# accumulators), but NUM_PHASE_BUCKETS separate small head networks selected by how much non-pawn
+# material is left — see phase_tag()/phase_bucket() below and mlp/train.py's matching copy of both
+# (kept in sync by hand, same as this file's other duplicated-on-purpose training-side logic).
+NUM_PHASE_BUCKETS = 4
+
 
 @dataclass(slots=True)
 class NNUEWeights:
-    ft_weight: np.ndarray  # int16, (FEATURE_DIM + 1, ACCUMULATOR_DIM)
+    ft_weight: np.ndarray  # int16, (FEATURE_DIM + 1, ACCUMULATOR_DIM) -- shared, not bucketed
     ft_scale: float
-    head1_weight: np.ndarray  # int8, (32, ACCUMULATOR_DIM * 2)
-    head1_scale: float
-    head1_bias: np.ndarray  # float32, (32,)
-    head3_weight: np.ndarray  # float32, (32, 32)
-    head3_bias: np.ndarray
-    head5_weight: np.ndarray  # float32, (1, 32)
-    head5_bias: np.ndarray
+    head1_weight: np.ndarray  # int8, (NUM_PHASE_BUCKETS, 32, ACCUMULATOR_DIM * 2)
+    head1_scale: np.ndarray  # float32, (NUM_PHASE_BUCKETS,) -- each bucket quantized separately
+    head1_bias: np.ndarray  # float32, (NUM_PHASE_BUCKETS, 32)
+    head3_weight: np.ndarray  # float32, (NUM_PHASE_BUCKETS, 32, 32)
+    head3_bias: np.ndarray  # float32, (NUM_PHASE_BUCKETS, 32)
+    head5_weight: np.ndarray  # float32, (NUM_PHASE_BUCKETS, 1, 32)
+    head5_bias: np.ndarray  # float32, (NUM_PHASE_BUCKETS, 1)
 
 
 def _quantize(weight: np.ndarray, bits: int) -> tuple[np.ndarray, float]:
@@ -159,18 +165,29 @@ def load_weights(path: Path = WEIGHTS_PATH) -> NNUEWeights:
         ft_weight, ft_scale = _load_integer(
             npz, "feature_transformer.weight", FEATURE_TRANSFORMER_BITS
         )
-        head1_weight, head1_scale = _load_integer(npz, "head.1.weight", HEAD_BITS)
+
+        head1_weights, head1_scales, head1_biases = [], [], []
+        head3_weights, head3_biases, head5_weights, head5_biases = [], [], [], []
+        for i in range(NUM_PHASE_BUCKETS):
+            w, s = _load_integer(npz, f"heads.{i}.1.weight", HEAD_BITS)
+            head1_weights.append(w)
+            head1_scales.append(s)
+            head1_biases.append(_load_float(npz, f"heads.{i}.1.bias"))
+            head3_weights.append(_load_float(npz, f"heads.{i}.3.weight"))
+            head3_biases.append(_load_float(npz, f"heads.{i}.3.bias"))
+            head5_weights.append(_load_float(npz, f"heads.{i}.5.weight"))
+            head5_biases.append(_load_float(npz, f"heads.{i}.5.bias"))
 
         return NNUEWeights(
             ft_weight=ft_weight,
             ft_scale=ft_scale,
-            head1_weight=head1_weight,
-            head1_scale=head1_scale,
-            head1_bias=_load_float(npz, "head.1.bias"),
-            head3_weight=_load_float(npz, "head.3.weight"),
-            head3_bias=_load_float(npz, "head.3.bias"),
-            head5_weight=_load_float(npz, "head.5.weight"),
-            head5_bias=_load_float(npz, "head.5.bias"),
+            head1_weight=np.stack(head1_weights),
+            head1_scale=np.array(head1_scales, dtype=np.float32),
+            head1_bias=np.stack(head1_biases),
+            head3_weight=np.stack(head3_weights),
+            head3_bias=np.stack(head3_biases),
+            head5_weight=np.stack(head5_weights),
+            head5_bias=np.stack(head5_biases),
         )
 
 
@@ -252,19 +269,23 @@ def _evaluate_head_jit(
     return np.float32(result)
 
 
-def evaluate_head(x: np.ndarray, weights: NNUEWeights) -> float:
-    """x: the concatenated (stm, nstm) accumulator, int32, shape (ACCUMULATOR_DIM * 2,)."""
+def evaluate_head(x: np.ndarray, weights: NNUEWeights, bucket: int) -> float:
+    """x: the concatenated (stm, nstm) accumulator, int32, shape (ACCUMULATOR_DIM * 2,). `bucket`
+    (see phase_bucket()) picks which of the NUM_PHASE_BUCKETS head networks to run -- a plain
+    index into weights.head*'s leading dimension, resolved here in Python before the numba call so
+    _evaluate_head_jit itself stays unchanged, single-head, and doesn't need to know phase
+    bucketing exists at all."""
     return float(
         _evaluate_head_jit(
             x,
-            weights.head1_weight,
+            weights.head1_weight[bucket],
             weights.ft_scale,
-            weights.head1_scale,
-            weights.head1_bias,
-            weights.head3_weight,
-            weights.head3_bias,
-            weights.head5_weight,
-            weights.head5_bias,
+            float(weights.head1_scale[bucket]),
+            weights.head1_bias[bucket],
+            weights.head3_weight[bucket],
+            weights.head3_bias[bucket],
+            weights.head5_weight[bucket],
+            weights.head5_bias[bucket],
         )
     )
 
@@ -554,6 +575,35 @@ def tt_slot_index(key: Hashable) -> tuple[int, int]:
     return sig % TT_SIZE, sig
 
 
+# Non-pawn material scale for phase_tag() below -- same values as mlp/train.py's PHASE_PIECE_VALUE
+# (kept in sync by hand, not imported: see the module docstring on why this file is self-contained).
+_PHASE_PIECE_VALUE = {
+    chess.KNIGHT: 320.0,
+    chess.BISHOP: 330.0,
+    chess.ROOK: 500.0,
+    chess.QUEEN: 900.0,
+}
+_STARTING_NON_PAWN_MATERIAL = 2 * (2 * 320.0 + 2 * 330.0 + 2 * 500.0 + 900.0)
+
+
+def phase_tag(board: chess.Board) -> float:
+    """Non-pawn material still on the board (both sides), normalized against the starting total:
+    1.0 at the game's start, trending toward 0.0 as pieces (not pawns) come off. Feeds
+    phase_bucket() to pick which of evaluate_head's NUM_PHASE_BUCKETS heads to run."""
+    material = sum(
+        len(board.pieces(pt, color)) * value
+        for pt, value in _PHASE_PIECE_VALUE.items()
+        for color in (chess.WHITE, chess.BLACK)
+    )
+    return material / _STARTING_NON_PAWN_MATERIAL
+
+
+def phase_bucket(phase: float) -> int:
+    """Same rule as mlp/train.py's phase_bucket() -- bucket 0 the most material (opening-ish),
+    NUM_PHASE_BUCKETS - 1 the least (bare-king-ish endgames)."""
+    return min(int((1.0 - phase) * NUM_PHASE_BUCKETS), NUM_PHASE_BUCKETS - 1)
+
+
 def evaluate(board: chess.Board) -> float:
     """Score relative to the side to move: positive means the mover is better. Reads whatever
     _ACC's accumulator currently holds — the caller is responsible for keeping it in sync with
@@ -563,7 +613,8 @@ def evaluate(board: chess.Board) -> float:
     if board.is_stalemate() or board.is_insufficient_material():
         return 0.0
     x = _ACC.accumulators_for(board.turn)
-    return evaluate_head(x, _WEIGHTS)
+    bucket = phase_bucket(phase_tag(board))
+    return evaluate_head(x, _WEIGHTS, bucket)
 
 
 def material_balance(board: chess.Board, perspective: bool) -> float:
@@ -792,11 +843,12 @@ def negamax(
 
     # Null-move pruning: if passing the move entirely still beats beta after a shallow look, a
     # real move can only be better, so skip this node. Skipped in check (passing isn't legal) and
-    # under 10 pieces (zugzwang endgames, where passing can be the only good move).
+    # under 10 pieces (zugzwang endgames, where passing can be the only good move). Reduction of 1
+    # (depth - 1 - 1), not the more standard 2 -- a gentler, less aggressive prune.
     if depth >= 3 and beta < MATE_SCORE and not in_check and chess.popcount(board.occupied) > 10:
         _ACC.push(board, chess.Move.null())
         null_score = -negamax(
-            board, depth - 1 - 2, -beta, -beta + 1, start_time, time_limit, path_keys
+            board, depth - 1 - 1, -beta, -beta + 1, start_time, time_limit, path_keys
         )
         _ACC.pop(board)
         if null_score >= beta:
